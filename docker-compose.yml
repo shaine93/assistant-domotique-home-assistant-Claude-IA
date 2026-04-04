@@ -1,0 +1,23 @@
+version: "3"
+services:
+  assistantia:
+    build: .
+    container_name: assistantia
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8501:8501"
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  deploy-server:
+    build: .
+    container_name: assistantia-deploy
+    restart: unless-stopped
+    command: python3 deploy_server.py
+    volumes:
+      - ./data:/app/data
+      - ./assistant.py:/app/assistant.py
+    ports:
+      - "8501:8501"

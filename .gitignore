@@ -1,0 +1,53 @@
+# Credentials & données personnelles
+config.json
+config.json.bak
+memory.db
+memory.db-journal
+comportement.txt
+
+# Logs
+*.log
+*.log.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Environnement
+.env
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Deploy
+deploy.log
+keepalive.log
+sync.log
+crash.log
+
+# Versions / backups
+versions/
+
+# Diag scripts
+diag_*.py
+check_*.py
+purge_*.py
+test_imports.py
+_clear_cache.py
