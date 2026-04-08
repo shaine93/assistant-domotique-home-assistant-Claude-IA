@@ -15,7 +15,7 @@ COMPORTEMENT = os.path.join(BASE_DIR, "comportement.txt")
 
 # ═══ VERSION ═══
 MODE    = "DEV"
-VERSION = "1.5.0"
+VERSION = "1.5.4"
 
 # ═══ MACHINES — Seuils de détection ═══
 SEUIL_CYCLE_W = 200   # Watts minimum pour démarrer un cycle

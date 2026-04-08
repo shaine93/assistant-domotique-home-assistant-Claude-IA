@@ -15,11 +15,11 @@ import time
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-SCRIPT_PATH = os.path.join(BASE_DIR, "assistant.py")
-ASSISTANT_DIR = BASE_DIR
-VERSIONS_DIR = os.path.join(BASE_DIR, "versions")
-DEPLOY_LOG = os.path.join(BASE_DIR, "deploy.log")
+CONFIG_PATH = ""+os.path.join(BASE_DIR,"config.json"
+SCRIPT_PATH = ""+os.path.join(BASE_DIR,"assistant.py"
+ASSISTANT_DIR = "/home/user/assistant"
+VERSIONS_DIR = ""+os.path.join(BASE_DIR,"versions"
+DEPLOY_LOG = ""+os.path.join(BASE_DIR,"deploy.log"
 PORT = 8501
 
 ALLOWED_EXTENSIONS = {".py", ".md", ".txt", ".json", ".yaml", ".yml", ".sh", ".cfg", ".ini"}
@@ -274,7 +274,7 @@ def action_status():
 
 def action_logs(n=50):
     try:
-        with open(os.path.join(BASE_DIR, "assistant.log"), "r") as f:
+        with open(""+os.path.join(BASE_DIR,"assistant.log", "r") as f:
             lines = f.readlines()
         return {"status": "ok", "lines": [l.rstrip() for l in lines[-n:]], "total_lines": len(lines)}
     except Exception as e:

@@ -95,6 +95,7 @@ __all__ = [
     "_snapshot_valide",
     "_watchdog",
     "_wizard_save_config",
+    "transcrire_vocal",
     "_wizard_step",
     "add_historique",
     "appareil_get",
@@ -2082,6 +2083,27 @@ def verifier_budget():
     return True
 
 
+def _appel_api_avec_retry(client, **kwargs):
+    """Appel API Anthropic avec retry backoff si 429. CRASH-PROOF."""
+    import anthropic as _anth
+    for tentative in range(4):  # Max 4 tentatives
+        try:
+            return client.messages.create(**kwargs)
+        except _anth.RateLimitError:
+            wait = (tentative + 1) * 15  # 15s, 30s, 45s, 60s
+            log.warning(f"⏳ Rate limit API — retry dans {wait}s (tentative {tentative + 1}/4)")
+            time.sleep(wait)
+        except _anth.APIStatusError as e:
+            if "overloaded" in str(e).lower():
+                wait = (tentative + 1) * 10
+                log.warning(f"⏳ API surchargée — retry dans {wait}s")
+                time.sleep(wait)
+            else:
+                raise
+    log.error("❌ API Anthropic: 4 tentatives échouées")
+    return None
+
+
 def appel_claude(message_utilisateur, contexte_ha=None):
     if not verifier_budget():
         return "⚠️ Budget API mensuel atteint."
@@ -2215,3 +2237,75 @@ def appel_claude(message_utilisateur, contexte_ha=None):
     except Exception as e:
         log.error(f"❌ Claude: {e}")
         return f"❌ Erreur Claude: {str(e)[:100]}"
+
+def transcrire_vocal(file_id):
+    """Transcrit un message vocal Telegram via Google Speech API. CRASH-PROOF."""
+    ogg_path = None
+    wav_path = None
+    try:
+        import shutil
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if not ffmpeg_bin:
+            local_ffmpeg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "ffmpeg")
+            if os.path.exists(local_ffmpeg):
+                ffmpeg_bin = local_ffmpeg
+            else:
+                log.warning("Vocal: ffmpeg non trouvé")
+                return None
+        import tempfile, subprocess
+        url_info = f"https://api.telegram.org/bot{CFG['telegram_token']}/getFile?file_id={file_id}"
+        r_info = requests.get(url_info, timeout=10)
+        if r_info.status_code != 200:
+            return None
+        file_path = r_info.json().get("result", {}).get("file_path", "")
+        if not file_path:
+            return None
+        url_dl = f"https://api.telegram.org/file/bot{CFG['telegram_token']}/{file_path}"
+        r_dl = requests.get(url_dl, timeout=30)
+        if r_dl.status_code != 200:
+            return None
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f_ogg:
+            f_ogg.write(r_dl.content)
+            ogg_path = f_ogg.name
+        flac_path = ogg_path.replace(".ogg", ".flac")
+        wav_path = flac_path
+        result = subprocess.run(
+            [ffmpeg_bin, "-y", "-i", ogg_path, "-ar", "16000", "-ac", "1", "-f", "flac", flac_path],
+            capture_output=True, timeout=30
+        )
+        if result.returncode != 0:
+            log.error(f"Vocal: ffmpeg error")
+            return None
+        with open(flac_path, "rb") as f_audio:
+            audio_data = f_audio.read()
+        url_google = "http://www.google.com/speech-api/v2/recognize?output=json&lang=fr-FR&key=AIzaSyBOti4mM-6x9WDnZIjIeyEU21OpBXqWBgw"
+        r_google = requests.post(url_google, data=audio_data, headers={"Content-Type": "audio/x-flac; rate=16000"}, timeout=15)
+        for line in r_google.text.strip().split("\n"):
+            line = line.strip()
+            if not line or line == '{"result":[]}':
+                continue
+            try:
+                data = json.loads(line)
+                results_g = data.get("result", [])
+                if results_g:
+                    alternatives = results_g[0].get("alternative", [])
+                    if alternatives:
+                        texte = alternatives[0].get("transcript", "")
+                        if texte:
+                            log.info(f"🎤 Vocal: {texte}")
+                            return texte
+            except json.JSONDecodeError:
+                continue
+        log.warning("Vocal: Google n'a pas reconnu de texte")
+        return None
+    except Exception as e:
+        log.error(f"Vocal: {e}")
+        return None
+    finally:
+        for f in [ogg_path, wav_path]:
+            if f:
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+

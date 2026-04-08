@@ -9,13 +9,13 @@ if _os.path.exists(_cache): _shutil.rmtree(_cache, ignore_errors=True)
 
 from skills import *
 from skills import _lancer_questionnaire_appareils, _lancer_questionnaire_foyer, _verifier_watches
-from shared import (_wizard_step, _wizard_save_config, _is_authorized_chat,
+from shared import (_wizard_step, _wizard_save_config, _is_authorized_chat, transcrire_vocal,
     _etat_prises, _grace_fin, _puissances_historique, _derniere_phase_haute,
     _rappel_linge_envoye, _defroissage_detecte, _watchdog, _entites_deja_detectees,
     _prises_snapshot, _coupure_edf_alertee, _snapshot_valide)
 import shared
 
-# Stdlib imports AFTER wildcard — garantit qu'ils ne sont pas écrasés
+# Stdlib AFTER wildcard
 import json, os, re, requests, sqlite3, smtplib, time, threading, anthropic
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
@@ -38,13 +38,13 @@ def backup_sqlite():
 
 def keepalive():
     while True:
-        with open(os.path.join(BASE_DIR, "keepalive.log"), "a") as f:
+        with open(""+os.path.join(BASE_DIR,"keepalive.log", "a") as f:
             f.write(f"{datetime.now().isoformat()} keepalive\n")
         try:
-            with open(os.path.join(BASE_DIR, "keepalive.log"), "r") as f:
+            with open(""+os.path.join(BASE_DIR,"keepalive.log", "r") as f:
                 lignes = f.readlines()
             if len(lignes) > 500:
-                with open(os.path.join(BASE_DIR, "keepalive.log"), "w") as f:
+                with open(""+os.path.join(BASE_DIR,"keepalive.log", "w") as f:
                     f.writelines(lignes[-200:])
         except Exception:
             pass
@@ -53,7 +53,7 @@ def keepalive():
 
 def _wizard_handle_message(texte):
     """Traite un message pendant le wizard. Retourne True si consommé."""
-    # global CFG  # → shared.CFG
+    global CFG
     step = _wizard_step()
     if not step:
         return False
@@ -493,7 +493,7 @@ def _scan_infiltration_auto():
 
 
 def audit_auto():
-    # global dernier_audit  # → shared.dernier_audit
+    global dernier_audit
     while True:
         now = time.time()
         interval = shared.CFG.get("audit_interval_sec", 1800)
@@ -587,7 +587,7 @@ def surveillance_batteries():
 
 
 def main():
-    # global canal_verrouille  # → shared.canal_verrouille
+    # global canal_verrouille  # → shared
     log.info(f"=== AssistantIA {VERSION} démarrage ===")
 
     init_db()
@@ -658,14 +658,14 @@ def main():
             dt = datetime.strptime(dernier_code[:19], "%Y-%m-%dT%H:%M:%S")
             if (datetime.now() - dt).total_seconds() < 86400:
                 skip_sms = True
-                canal_verrouille = False
+                shared.canal_verrouille = False
         except Exception:
             pass
 
     if skip_sms:
         telegram_send(bilan + "\n\n✅ Canal ouvert", force=True)
     else:
-        canal_verrouille = True
+        shared.canal_verrouille = True
         envoyer_code_sms()
         telegram_send(bilan + "\n\n🔐 Entrez le code SMS", force=True)
 
@@ -737,6 +737,10 @@ def main():
                 _etat_prises[eid] = "actif"
                 _rappel_linge_envoye[eid] = True
                 log.info(f"🔄 Cycle restauré : {app_nom} ({int(duree_min)} min, {int(puissance_now)}W)")
+                try:
+                    telegram_send(f"🔄 {app_nom} toujours en marche ({int(duree_min)} min, {int(puissance_now)}W)")
+                except Exception:
+                    pass
             else:
                 # Machine à l'arrêt → demander à l'utilisateur (pas de double notification)
                 _etat_prises[eid] = "attente_restart"
@@ -843,6 +847,24 @@ def main():
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 texte   = msg.get("text", "").strip()
 
+                # ═══ MESSAGE VOCAL → transcription ═══
+                if not texte and "voice" in msg:
+                    if _is_authorized_chat(chat_id):
+                        try:
+                            file_id = msg["voice"].get("file_id")
+                            if file_id:
+                                telegram_send("🎤 Transcription en cours...")
+                                texte = transcrire_vocal(file_id)
+                                if texte:
+                                    telegram_send(f"🎤 _{texte}_", force=True)
+                                else:
+                                    telegram_send("❌ Transcription impossible — tapez votre commande.")
+                                    continue
+                        except Exception as e_vocal:
+                            log.error(f"Vocal: {e_vocal}")
+                            telegram_send("❌ Erreur vocale — tapez votre commande.")
+                            continue
+
                 if not texte or not _is_authorized_chat(chat_id):
                     if texte:
                         log.warning(f"⚠️ chat_id inconnu: {chat_id}")
@@ -859,7 +881,7 @@ def main():
                                 pass
                         continue
 
-                if canal_verrouille:
+                if shared.canal_verrouille:
                     # /sms → renvoyer un nouveau code (même si verrouillé)
                     if texte.strip().lower() in ("/sms", "sms"):
                         envoyer_code_sms()

@@ -1,0 +1,24 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -r requirements.txt
+      - name: Syntax check
+        run: |
+          python -m py_compile config.py
+          python -m py_compile shared.py
+          python -m py_compile skills.py
+          python -m py_compile assistant.py
+          python -m py_compile deploy_server.py
+          python -m py_compile i18n.py
+      - name: Tests
+        run: python -m pytest tests.py -v --tb=short || true

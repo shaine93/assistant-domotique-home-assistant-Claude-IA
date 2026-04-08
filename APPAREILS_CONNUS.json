@@ -1,0 +1,167 @@
+{
+  "lave_linge": {
+    "nom": "Lave-linge",
+    "emoji": "🧺",
+    "puissance_min_w": 50,
+    "puissance_max_w": 2500,
+    "duree_min_min": 30,
+    "duree_max_min": 180,
+    "conso_kwh_typique": [
+      0.5,
+      2.5
+    ],
+    "pauses_connues": [
+      "rinçage 5-15min entre phases",
+      "essorage intermittent"
+    ],
+    "pieges": [
+      "pause rinçage confondue avec fin de cycle",
+      "hublot verrouillé 3-5min après fin"
+    ]
+  },
+  "seche_linge": {
+    "nom": "Sèche-linge",
+    "emoji": "👕",
+    "puissance_min_w": 30,
+    "puissance_max_w": 3000,
+    "duree_min_min": 30,
+    "duree_max_min": 120,
+    "conso_kwh_typique": [
+      1.0,
+      4.0
+    ],
+    "pauses_connues": [
+      "défroissage automatique: rotation basse toutes les 10min pendant 2-4h"
+    ],
+    "pieges": [
+      "défroissage reset la grâce → cycle 300min",
+      "cycle doux <200W non détecté par seuil standard"
+    ]
+  },
+  "lave_vaisselle": {
+    "nom": "Lave-vaisselle",
+    "emoji": "🍽️",
+    "puissance_min_w": 10,
+    "puissance_max_w": 2200,
+    "duree_min_min": 45,
+    "duree_max_min": 240,
+    "conso_kwh_typique": [
+      0.8,
+      1.8
+    ],
+    "pauses_connues": [
+      "séchage passif 10-30min en fin",
+      "pause entre lavage et rinçage"
+    ],
+    "pieges": [
+      "vaisselle chaude → attendre 10min avant ouverture"
+    ]
+  },
+  "ballon_thermodynamique": {
+    "nom": "Ballon thermodynamique",
+    "emoji": "🔥",
+    "puissance_min_w": 300,
+    "puissance_max_w": 2000,
+    "duree_min_min": 60,
+    "duree_max_min": 480,
+    "conso_kwh_typique": [
+      1.5,
+      5.0
+    ],
+    "pauses_connues": [
+      "mode maintien basse conso entre chauffe"
+    ],
+    "pieges": [
+      "corrélation température extérieure",
+      "optimiser avec HC"
+    ]
+  },
+  "borne_ev": {
+    "nom": "Borne de recharge VE",
+    "emoji": "🔌",
+    "puissance_min_w": 1000,
+    "puissance_max_w": 7400,
+    "duree_min_min": 60,
+    "duree_max_min": 720,
+    "conso_kwh_typique": [
+      5.0,
+      50.0
+    ],
+    "pauses_connues": [
+      "charge complète → coupure nette"
+    ],
+    "pieges": [
+      "grosse conso → impact facture si pas HC/solaire"
+    ]
+  },
+  "seche_serviettes": {
+    "nom": "Sèche-serviettes",
+    "emoji": "🛁",
+    "puissance_min_w": 300,
+    "puissance_max_w": 1000,
+    "duree_min_min": 30,
+    "duree_max_min": 180,
+    "conso_kwh_typique": [
+      0.3,
+      1.5
+    ],
+    "pauses_connues": [
+      "thermostat coupe/remet en cycle"
+    ],
+    "pieges": [
+      "oublié allumé = consommation fantôme"
+    ]
+  },
+  "pompe_piscine": {
+    "nom": "Pompe piscine",
+    "emoji": "🏊",
+    "puissance_min_w": 300,
+    "puissance_max_w": 1500,
+    "duree_min_min": 120,
+    "duree_max_min": 720,
+    "conso_kwh_typique": [
+      2.0,
+      8.0
+    ],
+    "pauses_connues": [],
+    "pieges": [
+      "tourne souvent en été → grosse conso si pas en HC"
+    ]
+  },
+  "four": {
+    "nom": "Four",
+    "emoji": "🍳",
+    "puissance_min_w": 1000,
+    "puissance_max_w": 3500,
+    "duree_min_min": 15,
+    "duree_max_min": 240,
+    "conso_kwh_typique": [
+      0.5,
+      3.0
+    ],
+    "pauses_connues": [
+      "thermostat coupe/remet"
+    ],
+    "pieges": [
+      "conso intermittente = pas un cycle continu"
+    ]
+  },
+  "congelateur": {
+    "nom": "Congélateur",
+    "emoji": "❄️",
+    "puissance_min_w": 50,
+    "puissance_max_w": 200,
+    "duree_min_min": 0,
+    "duree_max_min": 0,
+    "conso_kwh_typique": [
+      0.5,
+      1.5
+    ],
+    "pauses_connues": [
+      "compresseur cyclique normal"
+    ],
+    "pieges": [
+      "si coupure EDF >2h → chaîne du froid compromise"
+    ]
+  }
+}

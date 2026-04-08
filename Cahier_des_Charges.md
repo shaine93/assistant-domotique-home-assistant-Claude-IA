@@ -58,11 +58,11 @@ E3
 
 INFRASTRUCTURE :
 - VM Google Cloud : user@instance-20260226-111134 / 34.168.105.47
-- Script : /home/user/assistant/assistant.py (~10454 lignes, v1.5.0)
+- Script : "+os.path.join(BASE_DIR,"assistant.py (~10454 lignes, v1.5.0)
 - Deploy Server : port 8501, HMAC-SHA256
 - Deploy secret : 45605531a18b27dca47cc640701f8c7c6571cdba33b0876b152e1e31be161ec4
-- DB : /home/user/assistant/memory.db (21 tables)
-- MD : /home/user/assistant/Cahier_des_Charges.md
+- DB : "+os.path.join(BASE_DIR,"memory.db (21 tables)
+- MD : "+os.path.join(BASE_DIR,"Cahier_des_Charges.md
 
 DEPLOY SERVER :
 - GET (Bearer token) : /ping /status /read /read/<path> /logs?n=N /ls
@@ -511,7 +511,7 @@ Structure prête : `addon/config.yaml`, `Dockerfile`, `run.sh`, `DOCS.md`, `CHAN
 
 ---
 
-## 📕 DOCTRINE — 11 RÈGLES
+## 📕 DOCTRINE — 12 RÈGLES
 
 1. **AUTONOMIE 500%** — L'utilisateur ne fait RIEN. Le script se met à jour tout seul depuis GitHub, se corrige tout seul, apprend tout seul
 2. **TOKENS RENTABLES** — ROI positif, chaque token construit de l'expertise
@@ -526,6 +526,36 @@ Structure prête : `addon/config.yaml`, `Dockerfile`, `run.sh`, `DOCS.md`, `CHAN
 11. **AUTO-CORRECTION** — Erreurs remontées → auto-correction Sonnet
 
 ---
+
+
+### Règle 12 — ISOLATION DES FEATURES
+
+**Toute nouvelle fonctionnalité DOIT tourner dans un bloc isolé.**
+
+```python
+# ❌ INTERDIT — un crash tue la boucle
+texte = transcrire_vocal(file_id)
+
+# ✅ OBLIGATOIRE — crash isolé, boucle continue
+try:
+    texte = transcrire_vocal(file_id)
+except Exception as e:
+    log.error(f"Feature X: {e}")
+    telegram_send("❌ Fonctionnalité indisponible.")
+    continue
+```
+
+**Principes :**
+1. Chaque feature est un `try/except` autonome — si elle crash, le script continue
+2. Les dépendances optionnelles (pip, apt) s'installent en background — si absentes, la feature retourne `None`
+3. Le polling Telegram ne doit JAMAIS s'arrêter à cause d'une feature
+4. Diagnostic d'import chain AVANT de toucher au service en production
+5. Rollback automatique si le diagnostic échoue
+
+**Test avant déploiement :**
+- Déployer un script diagnostic qui teste `from shared import *` + `from skills import *`
+- Vérifier que tous les noms critiques sont accessibles
+- Seulement ensuite déployer le vrai `assistant.py`
 
 ## ## ⚠️ PIÈGES CONNUS (ne pas refaire) :
 - sensor.ecu_current_power glitche à 0W → fallback skill fenêtre solaire
@@ -718,13 +748,86 @@ AssistantIA est le premier agent qui **apprend, surveille, corrige, et mesure le
 - [x] Guide déploiement complet (7 machines, 4 méthodes)
 - [x] Mise en service Claude Opus 4.6
 
+
+
+## 📋 CHANGELOG v7.60 → v7.61 (04-07 avril 2026)
+
+### Nouvelles fonctionnalités
+- **Commandes vocales Telegram** : message vocal → Google Speech API → texte → commande. ffmpeg statique local, zéro dépendance pip
+- **Tool Use HA** : pilotage appareils en langage naturel (10 domaines), confirmation boutons ✅/❌
+- **Alertes dynamiques (watches)** : surveillance personnalisée, pattern matching glob, cooldown
+- **Projection facture EDF** : estimation fin de mois basée sur conso courante
+- **Timezone Europe/Paris** : heure d'été/hiver automatique via `os.environ['TZ']`
+- **Auto-update GitHub** : vérifie main toutes les 24h, télécharge, valide syntaxe, backup, restart
+- **Alerte conso fantôme nocturne** : détecte conso anormale 1h-5h (baseline + 150W)
+- **Alerte congélateur coupure longue** : si EDF coupé > 2h → alerte au retour
+- **Mode vacances auto** : 48h sans interaction → surveillance réduite
+- **Notification cycle restauré** : après restart, notification Telegram si machine tourne encore
+- **Détection cycle doux** : sèche-linge éco/délicat < 200W détecté après 5 min de conso continue
+
+### Corrections
+- Split 4 fichiers stable en production (config/shared/skills/assistant)
+- `_ErrorCaptureHandler` ajouté dans shared.py (manquait du split)
+- Logging setup (`log = logging.getLogger()`) dans shared.py
+- 25 variables globales extraites du monolithe vers shared.py
+- stdlib imports APRÈS wildcard (bug sqlite3 not defined)
+- Suppression "Nommer ce programme" (2 emplacements)
+- Sécurité boutons Telegram : canal verrouillé bloque les callbacks
+- `HEURE_BRIEFING_TRAVAIL` corrigé 5 (UTC) → 7 (Paris)
+
+### Doctrine
+- **Règle 12 — Isolation des features** : chaque feature dans try/except, dépendances optionnelles retournent None, polling Telegram ne s'arrête JAMAIS
+- Diagnostic d'import chain AVANT déploiement en production
+- Rollback automatique si diagnostic échoue
+
+### Architecture
+```
+config.py      →    98 lignes   Constantes, seuils, timezone
+shared.py      → 2 317 lignes   __all__ (124), logging, globals, Telegram, HA, SQLite, transcrire_vocal
+skills.py      → 10 587 lignes  Commandes, cycles, économies, surveillance, watches, auto-update
+assistant.py   →    920 lignes   main(), threads, wizard, voice handler, pycache cleaner
+```
+
+
+### v1.5.2 (07 avril 2026)
+- **Backup auto DB** : memory.db + config.json chaque nuit à 3h, purge > 30 jours
+- **Score énergétique DPE** : `/score` — note A-D sur 100 (solaire, économies, standbys, Zigbee, HC/HP, baselines)
+- **Export PDF mensuel** : `/export` — rapport complet envoyé par email
+- **Conseil contrat** : `/contrat` — compare les offres EDF/TotalEnergies/Octopus
+- **Commandes** : score, dpe, export, pdf, contrat, conseil
+
+
+### v1.5.3 (08 avril 2026)
+- **Détection coupure internet** : HA inaccessible > 5min → log, > 30min → alerte, > 60min → SMS
+- **Alerte Zigbee device mort** : devices unavailable > 24h, check quotidien 9h
+- **Notification Tempo/EJP** : jour rouge/blanc notifié la veille à 19h
+- **Détection fuite d'eau** : capteur moisture/water_leak → alerte immédiate
+- **Consommation par pièce** : `/pieces` — répartition par area HA
+- **Fix défroissage sèche-linge** : grâce ne reset plus sur défroissage < 200W après rappel
+- **Fix canal verrouillé SMS** : `shared.canal_verrouille` au lieu de variable locale
+- **Commandes** : pieces, pièces, rooms
+
+
+### v1.5.4 (08 avril 2026)
+- **APPAREILS_CONNUS.json** : bibliothèque 9 types (lave-linge, sèche-linge, lave-vaisselle, ballon thermo, borne EV, sèche-serviettes, pompe piscine, four, congélateur) avec pièges connus
+- **Rollback automatique** : 3+ crashes en 1h → rollback vers backup + notification
+- **Monitoring deploy server** : vérification 2x/h, alerte si down
+- **Commandes** : appareils, machines
+- **Fix /pieces** : filtre énergie solaire (APSystems exclu)
+
+### GitHub
+- Repo public : https://github.com/shaine93/assistant-domotique-home-assistant-Claude-IA
+- 27 fichiers, sanitisés, MIT license
+- Issue templates : bug report, feature request, bêta testeur
+- Post forum HACF : https://forum.hacf.fr/t/assistantia-domotique-lia-qui-gere-votre-maison-pendant-que-vous-dormez/78164
+
 ### À faire — v2.0
 
 #### 🔥 Priorité 1 — GitHub + Bêta testeurs
 
-- [ ] **Créer le repo GitHub public** : structure complète (assistant.py, deploy_server.py, addon/, tests.py, i18n.py, docker-compose.yml, systemd service, README.md, CHANGELOG.md, LICENSE MIT)
-- [ ] **README GitHub vitrine** : screenshots Telegram, architecture, ROI, comparatif avant/après, badges (HA compatible, Claude AI, Python 3.10+, MIT)
-- [ ] **Appel à 10 bêta testeurs** : post sur le forum HA Community, Reddit r/homeassistant, Discord HA. Texte :
+- [x] **Créer le repo GitHub public** : structure complète (assistant.py, deploy_server.py, addon/, tests.py, i18n.py, docker-compose.yml, systemd service, README.md, CHANGELOG.md, LICENSE MIT)
+- [x] **README GitHub vitrine** : screenshots Telegram, architecture, ROI, comparatif avant/après, badges (HA compatible, Claude AI, Python 3.10+, MIT)
+- [x] **Appel à 10 bêta testeurs** : post sur le forum HA Community, Reddit r/homeassistant, Discord HA. Texte :
   > **AssistantIA Domotique — L'antivirus de votre maison**
   > Agent IA autonome qui surveille votre Home Assistant 24/7, apprend vos habitudes, et vous fait économiser de l'énergie. Propulsé par Claude AI.
   >
@@ -737,7 +840,7 @@ AssistantIA est le premier agent qui **apprend, surveille, corrige, et mesure le
   > **Cherche 10 bêta testeurs** avec des installations différentes (avec/sans solaire, avec/sans pompe à chaleur, tous protocoles). Le script s'adapte à chaque configuration. Le déploiement est assisté.
   >
   > Repo : [lien GitHub]
-- [ ] **REFACTORING MODULES** — critique avant bêta. 13 000 lignes dans 1 fichier = problème :
+- [x] **REFACTORING MODULES** — critique avant bêta. 13 000 lignes dans 1 fichier = problème :
   - Auto-guérison Sonnet envoie le script COMPLET → ~100K tokens → ~0.30$/correction
   - Debug Opus remplit le contexte → session coupe → frustration
   - L'utilisateur paie pour des économies, pas pour du debug
@@ -796,7 +899,7 @@ AssistantIA est le premier agent qui **apprend, surveille, corrige, et mesure le
   **Coût actuel auto-guérison** : 13 000 lignes → ~100K tokens → 0.30$/appel
   **Coût après split** : skills.py 5 000 lignes → ~35K tokens → 0.10$/appel → **÷ 3**
 
-- [ ] **STRESS TEST avant bêta** — non négociable. Scénario complet :
+- [x] **STRESS TEST avant bêta** — non négociable. Scénario complet :
   1. Lancer un cycle lave-linge → vérifier notification démarrage + fin + rappel + économie
   2. Lancer un cycle sèche-linge → vérifier grâce 45 min + pas de fausse fin à 13 min + notification fin + linge chaud
   3. Restart pendant un cycle → vérifier pas de double notification + question boutons
@@ -808,8 +911,8 @@ AssistantIA est le premier agent qui **apprend, surveille, corrige, et mesure le
   9. Auto-guérison : injecter un bug → vérifier correction silencieuse
   10. Score résilience : vérifier succès logués après chaque cycle
   Résultat attendu : **10/10 sans incohérence**. Sinon pas de bêta.
-- [ ] **Issues templates** : bug report, feature request, nouveau fournisseur
-- [ ] **Auto-update silencieux** : le script vérifie GitHub toutes les 24h, télécharge la nouvelle version, valide la syntaxe, backup l'ancienne, remplace, restart. L'utilisateur ne fait rien. Jamais de `git pull`.
+- [x] **Issues templates** : bug report, feature request, nouveau fournisseur
+- [x] **Auto-update silencieux** : le script vérifie GitHub toutes les 24h, télécharge la nouvelle version, valide la syntaxe, backup l'ancienne, remplace, restart. L'utilisateur ne fait rien. Jamais de `git pull`.
 - [ ] **GitHub Actions CI** : pytest automatique à chaque push
 - [ ] **Releases automatiques** : tag → release → CHANGELOG
 
@@ -819,20 +922,20 @@ AssistantIA est le premier agent qui **apprend, surveille, corrige, et mesure le
 - [x] **Graphiques Telegram** : courbes conso EDF (baseline rouge) + solaire (jaune) + machines (bleu) du jour. matplotlib → sendPhoto. Intégré dans /energie et /solaire. Auto-install matplotlib si absent.
 - [x] **Briefing matin amélioré** : météo + calendrier + pic solaire prévu + poubelles + trajet. Un seul message à 7h qui résume tout.
 - [x] **Bilan mensuel automatique** : le 1er du mois à 10h. Réseau EDF (kWh + €), production solaire (kWh + couverture % + valeur €), économies IA (total + par type + vs mois précédent), cycles machines, % facture récupéré par l'IA.
-- [ ] **Alerte conso fantôme nocturne** : entre 1h-5h, si conso > baseline nuit + 150W → "Quelque chose est resté allumé"
-- [ ] **Estimation facture EDF fin de mois** : projection basée sur la conso des jours écoulés × tarif. "À ce rythme : ~58€ ce mois (vs 51€ le mois dernier)"
-- [ ] **Score énergétique maison** : DPE dynamique qui évolue chaque semaine (couverture solaire, conso/m², optimisation HC, économies cumulées). Note A→G affichée dans /intelligence
-- [ ] **Export mensuel PDF automatique** : le 1er de chaque mois, rapport PDF envoyé par email (économies, cycles, graphiques, score). L'utilisateur ne demande rien.
-- [ ] **Conseil changement contrat** : si le moteur tarification détecte qu'un autre fournisseur/offre ferait économiser > 5€/mois → notification proactive 1x/mois
-- [ ] **Mode vacances auto** : si aucune interaction Telegram + aucune machine lancée depuis 48h → passer en mode vacances (réduire les notifications, augmenter la surveillance coupure)
+- [x] **Alerte conso fantôme nocturne** : entre 1h-5h, si conso > baseline nuit + 150W → "Quelque chose est resté allumé"
+- [x] **Estimation facture EDF fin de mois** : projection basée sur la conso des jours écoulés × tarif. "À ce rythme : ~58€ ce mois (vs 51€ le mois dernier)"
+- [x] **Score énergétique maison** : DPE dynamique qui évolue chaque semaine (couverture solaire, conso/m², optimisation HC, économies cumulées). Note A→G affichée dans /intelligence
+- [x] **Export mensuel PDF automatique** : le 1er de chaque mois, rapport PDF envoyé par email (économies, cycles, graphiques, score). L'utilisateur ne demande rien.
+- [x] **Conseil changement contrat** : si le moteur tarification détecte qu'un autre fournisseur/offre ferait économiser > 5€/mois → notification proactive 1x/mois
+- [x] **Mode vacances auto** : si aucune interaction Telegram + aucune machine lancée depuis 48h → passer en mode vacances (réduire les notifications, augmenter la surveillance coupure)
 
 #### 🌐 Priorité 2b — Apprentissage collectif (10 bêta testeurs)
 
 Le vrai avantage : chaque installation apprend → les leçons sont partagées → tout le monde progresse.
 
 - [ ] **Leçons fondatrices partagées** : les pièges découverts par un testeur (ex: pause sèche-linge 38 min) sont intégrés au repo et profitent à tous via `git pull`
-- [ ] **Bibliothèque de profils appareils** : ballon thermodynamique, borne de recharge, sèche-serviettes, pompe piscine, four, cafetière — chaque testeur ajoute un type
-- [ ] **Fichier APPAREILS_CONNUS.json** : signatures de consommation types (durée min/max, puissance, pauses connues) partagées entre installations
+- [x] **Bibliothèque de profils appareils** : ballon thermodynamique, borne de recharge, sèche-serviettes, pompe piscine, four, cafetière — chaque testeur ajoute un type
+- [x] **Fichier APPAREILS_CONNUS.json** : signatures de consommation types (durée min/max, puissance, pauses connues) partagées entre installations
 - [ ] **Nouveaux types dans le questionnaire appareils** : ballon thermodynamique, borne EV, sèche-serviettes, pompe piscine, chauffe-eau
 - [ ] **Ballon thermodynamique** (pince ampèremétrique) : profil chauffe/veille, corrélation température ext, optimisation HC/solaire, détection anomalie (chauffe trop longue = fuite eau chaude ?)
 - [ ] **Remontée anonyme opt-in** : statistiques d'économies anonymisées → tableau comparatif (ROI moyen, kWh économisés, meilleur tarif)
@@ -842,20 +945,20 @@ Flux : testeur trouve un bug → issue GitHub → fix Opus → push → **auto-u
 #### 🔧 Priorité 3 — Robustesse
 
 - [ ] **Auto-guérison bout en bout testée** : injecter un bug volontaire, vérifier que Sonnet le corrige, que le restart se fait, que l'erreur disparaît
-- [ ] **Rollback automatique** : si erreur revient après auto-fix → rollback vers la version précédente
-- [ ] **Monitoring deploy server** : si le deploy server crash, le script le détecte et le relance
-- [ ] **Rate limiting API Anthropic** : retry avec backoff exponentiel si 429
-- [ ] **Backup automatique DB + config** : chaque nuit, copie memory.db + config.json dans un dossier daté. Garder 30 jours. Si corruption DB → restore auto
-- [ ] **Détection coupure internet** : si HA inaccessible > 5 min → log. Si > 30 min → alerte SMS (pas Telegram, car internet down). Quand ça revient → résumé de ce qui s'est passé pendant la coupure
-- [ ] **Santé congélateur sur coupure longue** : si coupure EDF > 2h + congélateur détecté → alerte "Vérifiez le congélateur" au retour du courant
+- [x] **Rollback automatique** : si erreur revient après auto-fix → rollback vers la version précédente
+- [x] **Monitoring deploy server** : si le deploy server crash, le script le détecte et le relance
+- [x] **Rate limiting API Anthropic** : retry avec backoff exponentiel si 429
+- [x] **Backup automatique DB + config** : chaque nuit, copie memory.db + config.json dans un dossier daté. Garder 30 jours. Si corruption DB → restore auto
+- [x] **Détection coupure internet** : si HA inaccessible > 5 min → log. Si > 30 min → alerte SMS (pas Telegram, car internet down). Quand ça revient → résumé de ce qui s'est passé pendant la coupure
+- [x] **Santé congélateur sur coupure longue** : si coupure EDF > 2h + congélateur détecté → alerte "Vérifiez le congélateur" au retour du courant
 
 #### 🚀 Priorité 4 — Vision produit (v3.0+)
 
-- [ ] **Suivi consommation par pièce** : si les areas HA sont configurées, regrouper la conso par pièce. "La chambre consomme 2x plus que d'habitude"
+- [x] **Suivi consommation par pièce** : si les areas HA sont configurées, regrouper la conso par pièce. "La chambre consomme 2x plus que d'habitude"
 - [ ] **Intégration vocale** : Google Home / Alexa via HA. "Hey Google, demande à l'assistant combien j'ai économisé ce mois"
-- [ ] **Détection fuite d'eau** : si capteur d'eau HA présent, surveiller et alerter immédiatement (SMS + Telegram)
-- [ ] **Alerte Zigbee device mort** : si un device a un LQI tombé à 0 depuis > 24h ou "unavailable" persistant → notification + suggestion (changer pile, rapprocher du routeur)
-- [ ] **Apprentissage tarif Tempo/EJP** : si contrat Tempo, notifier la veille "Demain jour ROUGE — décalez vos machines". Intégration API RTE
+- [x] **Détection fuite d'eau** : si capteur d'eau HA présent, surveiller et alerter immédiatement (SMS + Telegram)
+- [x] **Alerte Zigbee device mort** : si un device a un LQI tombé à 0 depuis > 24h ou "unavailable" persistant → notification + suggestion (changer pile, rapprocher du routeur)
+- [x] **Apprentissage tarif Tempo/EJP** : si contrat Tempo, notifier la veille "Demain jour ROUGE — décalez vos machines". Intégration API RTE
 - [ ] **Multi-logement** : un seul script qui gère plusieurs installations HA (résidence principale + secondaire)
 - [ ] **Dashboard web** : interface web simple (Flask/FastAPI) pour ceux qui préfèrent un navigateur à Telegram
 - [ ] **Plugin communautaire** : système de plugins pour que les testeurs ajoutent des fonctionnalités sans modifier le core (ex: plugin piscine, plugin photovoltaïque, plugin EV)

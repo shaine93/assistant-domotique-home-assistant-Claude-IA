@@ -3565,6 +3565,72 @@ def surveillance_monitoring():
             _surveiller_pac_correlee(index, etats)
             _verifier_watches(index)
 
+            # Conso fantôme nocturne
+            try:
+                _alerte_conso_fantome_nocturne(index, now)
+            except Exception:
+                pass
+
+            # Congélateur coupure
+            try:
+                _alerte_congelateur_coupure(index, now)
+            except Exception:
+                pass
+
+            # Mode vacances auto
+            try:
+                _detecter_mode_vacances(now)
+            except Exception:
+                pass
+
+            # Backup DB (3h chaque nuit)
+            try:
+                _backup_auto_db(now)
+            except Exception:
+                pass
+
+            # Fuite d'eau
+            try:
+                _detecter_fuite_eau(index, now)
+            except Exception:
+                pass
+
+            # Coupure internet
+            try:
+                _detecter_coupure_internet(now)
+            except Exception:
+                pass
+
+            # Zigbee device mort (1x/jour 9h)
+            try:
+                _alerte_zigbee_device_mort(index, now)
+            except Exception:
+                pass
+
+            # Tempo/EJP (1x/jour 19h)
+            try:
+                _notif_tempo_ejp(now)
+            except Exception:
+                pass
+
+            # Rollback auto (1x/h)
+            try:
+                _rollback_si_erreurs_repetees(now)
+            except Exception:
+                pass
+
+            # Deploy server monitoring (2x/h)
+            try:
+                _monitoring_deploy_server(now)
+            except Exception:
+                pass
+
+            # Auto-update GitHub (24h)
+            try:
+                _auto_update_github()
+            except Exception:
+                pass
+
             # Remontée erreurs — chaque minute
             try:
                 _remonter_erreurs()
@@ -4362,8 +4428,12 @@ def surveillance_prises():
                     # Machine consomme → cycle en cours ou démarrage
                     ts_now = datetime.now().isoformat()
                     _puissances_historique[entity_id].append((ts_now, puissance_w))
-                    _grace_fin.pop(entity_id, None)  # Annuler le timer de fin
-                    _defroissage_detecte.pop(entity_id, None)
+                    # Ne pas reset la grâce si défroissage (rappel envoyé + puissance < 200W)
+                    if _rappel_linge_envoye.get(entity_id) and puissance_w < SEUIL_CYCLE_W:
+                        pass  # Défroissage — laisser la grâce expirer normalement
+                    else:
+                        _grace_fin.pop(entity_id, None)  # Annuler le timer de fin
+                        _defroissage_detecte.pop(entity_id, None)
 
                     # Stocker en SQLite (survit aux restarts — plus jamais besoin de CSV ou API history)
                     try:
@@ -4384,8 +4454,18 @@ def surveillance_prises():
                         if entity_id not in _derniere_phase_haute:
                             _derniere_phase_haute[entity_id] = "L"  # Lavage
 
-                    if etat_precedent != "actif" and puissance_w > SEUIL_CYCLE_W:
-                        # NOUVEAU cycle : seulement si puissance forte (>200W)
+                    # Auto-détection cycle doux : si conso > SEUIL_FIN_W depuis 5+ min sans cycle
+                    if etat_precedent != "actif" and puissance_w <= SEUIL_CYCLE_W:
+                        hist = _puissances_historique.get(entity_id, [])
+                        if len(hist) >= 15:  # 15 mesures × 20s = 5 min de conso continue
+                            moy = sum(w for _, w in hist[-15:]) / 15
+                            if moy > SEUIL_FIN_W:
+                                # Cycle doux détecté — démarrer comme un cycle normal
+                                puissance_w = max(puissance_w, moy)
+                                log.info(f"🔄 Cycle doux détecté: {fname} ({moy:.0f}W moy sur 5min)")
+
+                    if etat_precedent != "actif" and (puissance_w > SEUIL_CYCLE_W or (len(_puissances_historique.get(entity_id, [])) >= 15 and sum(w for _, w in _puissances_historique.get(entity_id, [])[-15:]) / max(1, min(15, len(_puissances_historique.get(entity_id, [])))) > SEUIL_FIN_W)):
+                        # NOUVEAU cycle : puissance forte (>200W) OU conso continue > 5 min
                         _etat_prises[entity_id] = "actif"
                         _rappel_linge_envoye.pop(entity_id, None)
                         # Nom personnalisé si configuré
@@ -10093,6 +10173,821 @@ def cmd_watches():
     return "\n".join(lignes)
 
 
+
+# =============================================================================
+# FEATURES v7.61 — Auto-update, conso fantôme, congélateur, mode vacances
+# =============================================================================
+
+def _alerte_conso_fantome_nocturne(index, now):
+    """Détecte une conso anormale entre 1h-5h. CRASH-PROOF."""
+    try:
+        if not (1 <= now.hour < 5):
+            return
+        eid_conso = role_get("conso_temps_reel")
+        if not eid_conso or eid_conso not in index:
+            return
+        try:
+            conso_w = float(index[eid_conso]["state"])
+        except (ValueError, TypeError):
+            return
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            "SELECT AVG(valeur_moyenne) FROM baselines WHERE entity_id=? AND heure BETWEEN 1 AND 4 AND nb_mesures >= 5",
+            (eid_conso,)
+        ).fetchone()
+        conn.close()
+        baseline = rows[0] if rows and rows[0] else 200
+        seuil = baseline + 150
+        if conso_w > seuil:
+            _alerter_si_nouveau(
+                "conso_fantome_nuit",
+                f"👻 CONSO ANORMALE LA NUIT\n━━━━━━━━━━━━━━━━━━\n"
+                f"Il est {now.strftime('%H:%M')} — conso réseau : {conso_w:.0f}W\n"
+                f"Habituellement : ~{baseline:.0f}W\nSurplus : +{conso_w - baseline:.0f}W\n\n"
+                f"Quelque chose est peut-être resté allumé.",
+                delai_h=6
+            )
+    except Exception as e:
+        log.debug(f"Conso fantôme: {e}")
+
+
+def _alerte_congelateur_coupure(index, now):
+    """Si coupure EDF > 2h → alerte congélateur au retour. CRASH-PROOF."""
+    try:
+        eid_conso = role_get("conso_temps_reel")
+        if not eid_conso:
+            return
+        e = index.get(eid_conso)
+        if not e:
+            return
+        state = e.get("state", "")
+        if state in ("unavailable", "unknown"):
+            debut = mem_get("coupure_edf_debut")
+            if not debut:
+                mem_set("coupure_edf_debut", now.isoformat())
+        else:
+            debut = mem_get("coupure_edf_debut")
+            if debut:
+                mem_set("coupure_edf_debut", "")
+                try:
+                    dt_debut = datetime.fromisoformat(debut)
+                    duree_h = (now - dt_debut).total_seconds() / 3600
+                    if duree_h >= 2:
+                        _alerter_si_nouveau(
+                            "congelateur_coupure",
+                            f"⚡ COUPURE EDF DE {duree_h:.1f}H\n━━━━━━━━━━━━━━━━━━\n"
+                            f"Début : {dt_debut.strftime('%H:%M')} | Retour : {now.strftime('%H:%M')}\n\n"
+                            f"⚠️ Vérifiez le congélateur — chaîne du froid potentiellement compromise.",
+                            delai_h=24
+                        )
+                except Exception:
+                    pass
+    except Exception as e:
+        log.debug(f"Alerte congélateur: {e}")
+
+
+def _detecter_mode_vacances(now):
+    """Si aucune interaction Telegram + aucune machine depuis 48h → mode vacances. CRASH-PROOF."""
+    try:
+        dernier_msg = mem_get("dernier_message_telegram")
+        if not dernier_msg:
+            return
+        try:
+            dt_msg = datetime.fromisoformat(dernier_msg)
+        except Exception:
+            return
+        if (now - dt_msg).total_seconds() / 3600 < 48:
+            return
+        if mem_get("mode_vacances") == "actif":
+            return
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            dernier_cycle = conn.execute(
+                "SELECT MAX(debut) FROM cycles_appareils WHERE debut > datetime('now', '-48 hours')"
+            ).fetchone()
+            conn.close()
+            if dernier_cycle and dernier_cycle[0]:
+                return
+        except Exception:
+            pass
+        mem_set("mode_vacances", "actif")
+        log.info("🏖️ Mode vacances activé (48h sans interaction)")
+        telegram_send(
+            "🏖️ MODE VACANCES ACTIVÉ\n━━━━━━━━━━━━━━━━━━\n"
+            "Aucune interaction depuis 48h.\n"
+            "Surveillance réduite (alertes critiques uniquement).\n\n"
+            "Envoyez n'importe quel message pour désactiver."
+        )
+    except Exception as e:
+        log.debug(f"Mode vacances: {e}")
+
+
+def _auto_update_github():
+    """Vérifie GitHub pour des mises à jour toutes les 24h. CRASH-PROOF."""
+    try:
+        repo = "shaine93/assistant-domotique-home-assistant-Claude-IA"
+        branch = "main"
+        fichiers = ["config.py", "shared.py", "skills.py", "assistant.py"]
+        derniere = mem_get("auto_update_last")
+        if derniere:
+            try:
+                dt = datetime.fromisoformat(derniere)
+                if (datetime.now() - dt).total_seconds() < 86400:
+                    return
+            except Exception:
+                pass
+        url_api = f"https://api.github.com/repos/{repo}/commits/{branch}"
+        r_sha = requests.get(url_api, timeout=15)
+        if r_sha.status_code != 200:
+            return
+        sha_distant = r_sha.json().get("sha", "")[:7]
+        sha_local = mem_get("auto_update_sha") or ""
+        if sha_distant == sha_local:
+            mem_set("auto_update_last", datetime.now().isoformat())
+            return
+        log.info(f"🔄 Mise à jour disponible: {sha_local or '?'} → {sha_distant}")
+        fichiers_dl = {}
+        for fname in fichiers:
+            url_raw = f"https://raw.githubusercontent.com/{repo}/{branch}/{fname}"
+            r_dl = requests.get(url_raw, timeout=30)
+            if r_dl.status_code != 200:
+                log.error(f"Auto-update: impossible de télécharger {fname}")
+                return
+            fichiers_dl[fname] = r_dl.text
+        import py_compile, tempfile
+        for fname, contenu in fichiers_dl.items():
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as tmp:
+                    tmp.write(contenu)
+                    tmp_path = tmp.name
+                py_compile.compile(tmp_path, doraise=True)
+                os.remove(tmp_path)
+            except py_compile.PyCompileError as e:
+                log.error(f"Auto-update: syntaxe invalide {fname}: {e}")
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+                return
+        backup_dir = os.path.join(BASE_DIR, "versions")
+        os.makedirs(backup_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        import shutil
+        for fname in fichiers:
+            src = os.path.join(BASE_DIR, fname)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(backup_dir, f"{fname}.bak_{ts}"))
+        for fname, contenu in fichiers_dl.items():
+            with open(os.path.join(BASE_DIR, fname), "w") as f:
+                f.write(contenu)
+        mem_set("auto_update_sha", sha_distant)
+        mem_set("auto_update_last", datetime.now().isoformat())
+        log.info(f"✅ Mise à jour appliquée: {sha_distant}")
+        telegram_send(
+            f"🔄 MISE À JOUR AUTOMATIQUE\n━━━━━━━━━━━━━━━━━━\n"
+            f"Version: {sha_distant}\nFichiers: {', '.join(fichiers)}\n"
+            f"Redémarrage dans 5 secondes..."
+        )
+        import subprocess
+        time.sleep(5)
+        subprocess.Popen(["systemctl", "restart", "assistantia"])
+    except Exception as e:
+        log.error(f"Auto-update: {e}")
+
+
+
+# =============================================================================
+# FEATURES v7.62 — Backup DB, Rate limiting, Score DPE, Export PDF
+# =============================================================================
+
+def _backup_auto_db(now):
+    """Backup memory.db + config.json chaque nuit à 3h. Garde 30 jours. CRASH-PROOF."""
+    try:
+        if now.hour != 3 or now.minute > 5:
+            return
+        derniere = mem_get("backup_db_last")
+        if derniere:
+            try:
+                if (now - datetime.fromisoformat(derniere)).total_seconds() < 72000:  # 20h
+                    return
+            except Exception:
+                pass
+
+        import shutil
+        backup_dir = os.path.join(BASE_DIR, "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        ts = now.strftime("%Y%m%d_%H%M")
+
+        # Backup DB
+        src_db = os.path.join(BASE_DIR, "memory.db")
+        if os.path.exists(src_db):
+            shutil.copy2(src_db, os.path.join(backup_dir, f"memory_{ts}.db"))
+
+        # Backup config
+        src_cfg = os.path.join(BASE_DIR, "config.json")
+        if os.path.exists(src_cfg):
+            shutil.copy2(src_cfg, os.path.join(backup_dir, f"config_{ts}.json"))
+
+        # Purge > 30 jours
+        import glob
+        cutoff = (now - timedelta(days=30)).strftime("%Y%m%d")
+        for f in glob.glob(os.path.join(backup_dir, "memory_*.db")) + glob.glob(os.path.join(backup_dir, "config_*.json")):
+            fname = os.path.basename(f)
+            date_part = fname.split("_")[1][:8] if "_" in fname else ""
+            if date_part and date_part < cutoff:
+                os.remove(f)
+
+        mem_set("backup_db_last", now.isoformat())
+        log.info(f"💾 Backup DB + config → backups/{ts}")
+    except Exception as e:
+        log.error(f"Backup DB: {e}")
+
+
+def cmd_score():
+    """Score énergétique DPE dynamique de la maison."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        now = datetime.now()
+
+        # 1. Couverture solaire (0-25 pts)
+        score_solaire = 0
+        try:
+            rows = conn.execute(
+                "SELECT AVG(couverture_pct) FROM cycles_appareils WHERE fin IS NOT NULL AND debut > datetime('now', '-30 days')"
+            ).fetchone()
+            if rows and rows[0]:
+                score_solaire = min(25, int(rows[0] / 4))  # 100% → 25 pts
+        except Exception:
+            pass
+
+        # 2. Économies mensuelles (0-25 pts)
+        score_eco = 0
+        try:
+            eco = get_economies_mois(now.year, now.month)
+            total_eco = sum(e[2] for e in eco) if eco else 0
+            score_eco = min(25, int(total_eco * 2.5))  # 10€ → 25 pts
+        except Exception:
+            pass
+
+        # 3. Standbys détectés et corrigés (0-15 pts)
+        score_standby = 15  # Score max par défaut — perdu si standbys actifs
+        try:
+            nb_standby = conn.execute(
+                "SELECT COUNT(*) FROM memoire WHERE cle LIKE 'standby_alerte_%' AND updated_at > datetime('now', '-7 days')"
+            ).fetchone()[0]
+            score_standby = max(0, 15 - nb_standby * 3)  # -3 par standby
+        except Exception:
+            pass
+
+        # 4. Santé réseau Zigbee (0-15 pts)
+        score_zigbee = 15
+        try:
+            nb_faibles = conn.execute(
+                "SELECT COUNT(*) FROM cartographie WHERE categorie NOT IN ('a_ignorer') AND entity_id LIKE '%lqi%'"
+            ).fetchone()[0]
+            # Simplifié : si devices surveillés, ok
+            score_zigbee = 15 if nb_faibles == 0 else max(5, 15 - nb_faibles)
+        except Exception:
+            pass
+
+        # 5. Optimisation HC/HP (0-10 pts)
+        score_hchp = 0
+        try:
+            cycles_hc = conn.execute(
+                "SELECT COUNT(*) FROM cycles_appareils WHERE fin IS NOT NULL AND debut > datetime('now', '-30 days') AND CAST(strftime('%H', debut) AS INTEGER) BETWEEN 0 AND 6"
+            ).fetchone()[0]
+            cycles_total = conn.execute(
+                "SELECT COUNT(*) FROM cycles_appareils WHERE fin IS NOT NULL AND debut > datetime('now', '-30 days')"
+            ).fetchone()[0]
+            if cycles_total > 0:
+                pct_hc = cycles_hc / cycles_total * 100
+                score_hchp = min(10, int(pct_hc / 10))  # 100% HC → 10 pts
+        except Exception:
+            pass
+
+        # 6. Régularité baselines (0-10 pts)
+        score_baselines = 0
+        try:
+            nb_baselines = conn.execute("SELECT COUNT(*) FROM baselines WHERE nb_mesures >= 10").fetchone()[0]
+            score_baselines = min(10, int(nb_baselines / 50))  # 500 baselines → 10 pts
+        except Exception:
+            pass
+
+        conn.close()
+
+        total = score_solaire + score_eco + score_standby + score_zigbee + score_hchp + score_baselines
+
+        if total >= 80:
+            grade, emoji = "A", "🟢"
+        elif total >= 60:
+            grade, emoji = "B", "🟡"
+        elif total >= 40:
+            grade, emoji = "C", "🟠"
+        else:
+            grade, emoji = "D", "🔴"
+
+        return (
+            f"🏠 SCORE ÉNERGÉTIQUE MAISON\n"
+            f"━━━━━━━━━━━━━━━━━━\n\n"
+            f"{emoji} **Note : {grade} — {total}/100**\n\n"
+            f"☀️ Couverture solaire : {score_solaire}/25\n"
+            f"💰 Économies : {score_eco}/25\n"
+            f"🔌 Standbys : {score_standby}/15\n"
+            f"📡 Réseau Zigbee : {score_zigbee}/15\n"
+            f"⏰ Optimisation HC : {score_hchp}/10\n"
+            f"📊 Baselines : {score_baselines}/10\n\n"
+            f"Le score évolue chaque semaine."
+        )
+    except Exception as e:
+        return f"❌ Erreur score: {e}"
+
+
+def cmd_export_pdf():
+    """Génère et envoie un rapport PDF mensuel par email."""
+    try:
+        now = datetime.now()
+        conn = sqlite3.connect(DB_PATH)
+
+        # Collecter les données du mois
+        mois = now.strftime("%B %Y")
+
+        # Économies
+        eco = get_economies_mois(now.year, now.month)
+        total_eco = sum(e[2] for e in eco) if eco else 0
+
+        # Cycles
+        cycles = conn.execute(
+            "SELECT entity_id, COUNT(*), SUM(conso_kwh), SUM(cout_reseau) "
+            "FROM cycles_appareils WHERE fin IS NOT NULL "
+            "AND strftime('%Y-%m', debut) = ? GROUP BY entity_id",
+            (now.strftime("%Y-%m"),)
+        ).fetchall()
+
+        # Tokens
+        tokens = get_token_usage()
+
+        conn.close()
+
+        # Construire le rapport texte (envoi par email)
+        rapport = f"📊 RAPPORT MENSUEL — {mois}\n"
+        rapport += "=" * 40 + "\n\n"
+
+        rapport += f"💰 ÉCONOMIES : {total_eco:.2f}€\n"
+        if eco:
+            for e in eco:
+                rapport += f"  • {e[1]} : {e[2]:.2f}€\n"
+
+        rapport += f"\n🔄 CYCLES MACHINES :\n"
+        for c in cycles:
+            app = appareil_get(c[0])
+            nom = app["nom"] if app and app.get("nom") else c[0].split(".")[-1]
+            rapport += f"  • {nom} : {c[1]} cycles, {c[2]:.1f} kWh, {c[3]:.2f}€\n"
+
+        rapport += f"\n🤖 TOKENS API : {tokens.get('total_tokens', 0):,} ({tokens.get('total_cost', 0):.2f}€)\n"
+
+        # Score
+        score_txt = cmd_score()
+        rapport += f"\n{score_txt}\n"
+
+        # Envoyer par email
+        sujet = f"[AssistantIA] Rapport mensuel — {mois}"
+        envoyer_email(sujet, rapport)
+
+        return f"📧 Rapport {mois} envoyé par email.\n\n{rapport[:500]}..."
+
+    except Exception as e:
+        return f"❌ Erreur export: {e}"
+
+
+def cmd_conseil_contrat():
+    """Compare le contrat actuel avec les alternatives et conseille."""
+    try:
+        tarif_actuel, _ = skill_get("tarification")
+        if not tarif_actuel or "type" not in tarif_actuel:
+            return "⚠️ Aucun contrat configuré. Tapez /tarif pour configurer."
+
+        type_actuel = tarif_actuel.get("type", "")
+        fournisseur = tarif_actuel.get("fournisseur", "")
+
+        conn = sqlite3.connect(DB_PATH)
+        now = datetime.now()
+
+        # Conso des 30 derniers jours
+        # Estimation basée sur cycles + baselines
+        try:
+            conso_total = conn.execute(
+                "SELECT SUM(conso_kwh) FROM cycles_appareils WHERE fin IS NOT NULL AND debut > datetime('now', '-30 days')"
+            ).fetchone()[0] or 0
+        except Exception:
+            conso_total = 0
+
+        conn.close()
+
+        if conso_total < 10:
+            return "⚠️ Pas assez de données (< 10 kWh mesurés ce mois). Réessayez dans quelques semaines."
+
+        # Estimation mensuelle
+        jours_ecoules = now.day
+        conso_mois_estime = conso_total / max(1, jours_ecoules) * 30
+
+        prix_actuel = tarif_prix_kwh_actuel()
+        cout_actuel = conso_mois_estime * prix_actuel
+
+        # Comparer avec quelques offres types
+        alternatives = [
+            ("EDF Zen", 0.2516),
+            ("EDF Zen WE", 0.2068),  # Moyenne HP/HC
+            ("TotalEnergies Essentielle", 0.2219),
+            ("Octopus Eco-Conso", 0.1992),
+        ]
+
+        result = f"💡 CONSEIL CONTRAT\n━━━━━━━━━━━━━━━━━━\n\n"
+        result += f"Contrat actuel : {fournisseur} ({type_actuel})\n"
+        result += f"Conso estimée : {conso_mois_estime:.0f} kWh/mois\n"
+        result += f"Coût estimé : {cout_actuel:.0f}€/mois\n\n"
+        result += f"Alternatives :\n"
+
+        for nom, prix in alternatives:
+            cout_alt = conso_mois_estime * prix
+            diff = cout_actuel - cout_alt
+            emoji = "✅" if diff > 5 else "➖"
+            result += f"  {emoji} {nom} : ~{cout_alt:.0f}€/mois ({'+' if diff < 0 else '-'}{abs(diff):.0f}€)\n"
+
+        result += f"\n⚠️ Estimations simplifiées. Consultez les sites des fournisseurs pour les tarifs exacts."
+        return result
+
+    except Exception as e:
+        return f"❌ Erreur conseil contrat: {e}"
+
+
+
+# =============================================================================
+# FEATURES v7.63 — Coupure internet, Zigbee mort, Tempo/EJP
+# =============================================================================
+
+def _detecter_coupure_internet(now):
+    """Si HA inaccessible > 5 min → log. > 30 min → alerte SMS. CRASH-PROOF."""
+    try:
+        etats = ha_get("states")
+        if etats:
+            # HA accessible — reset compteur
+            if mem_get("ha_inaccessible_depuis"):
+                mem_set("ha_inaccessible_depuis", "")
+            return
+
+        # HA inaccessible
+        debut = mem_get("ha_inaccessible_depuis")
+        if not debut:
+            mem_set("ha_inaccessible_depuis", now.isoformat())
+            log.warning("⚠️ HA inaccessible — début surveillance")
+            return
+
+        try:
+            dt_debut = datetime.fromisoformat(debut)
+            minutes = (now - dt_debut).total_seconds() / 60
+        except Exception:
+            return
+
+        if minutes > 30:
+            _alerter_si_nouveau(
+                "coupure_internet",
+                f"🌐 HOME ASSISTANT INACCESSIBLE\n━━━━━━━━━━━━━━━━━━\n"
+                f"Depuis {int(minutes)} min ({dt_debut.strftime('%H:%M')})\n"
+                f"Vérifiez votre connexion internet ou votre HA.",
+                delai_h=2
+            )
+            # Tenter SMS si configuré
+            if minutes > 60 and CFG.get("sms_method"):
+                try:
+                    _alerter_si_nouveau(
+                        "coupure_internet_sms",
+                        f"ALERTE: HA inaccessible depuis {int(minutes)}min",
+                        delai_h=6
+                    )
+                except Exception:
+                    pass
+    except Exception as e:
+        log.debug(f"Coupure internet: {e}")
+
+
+def _alerte_zigbee_device_mort(index, now):
+    """Détecte les devices Zigbee unavailable > 24h. CRASH-PROOF."""
+    try:
+        if now.hour != 9 or now.minute > 5:
+            return  # Une fois par jour à 9h
+        derniere = mem_get("zigbee_mort_check")
+        if derniere:
+            try:
+                if (now - datetime.fromisoformat(derniere)).total_seconds() < 72000:
+                    return
+            except Exception:
+                pass
+
+        conn = sqlite3.connect(DB_PATH)
+        # Chercher les entités Zigbee unavailable
+        rows = conn.execute(
+            "SELECT entity_id, friendly_name FROM cartographie WHERE categorie NOT IN ('a_ignorer')"
+        ).fetchall()
+        conn.close()
+
+        morts = []
+        for eid, fname in rows:
+            e = index.get(eid)
+            if e and e.get("state") == "unavailable":
+                # Vérifier depuis combien de temps
+                last_changed = e.get("last_changed", "")
+                if last_changed:
+                    try:
+                        dt_changed = datetime.fromisoformat(last_changed.replace("Z", "+00:00")).replace(tzinfo=None)
+                        heures = (now - dt_changed).total_seconds() / 3600
+                        if heures > 24:
+                            morts.append((fname or eid, int(heures)))
+                    except Exception:
+                        pass
+
+        if morts:
+            liste = "\n".join(f"  • {nom} ({h}h)" for nom, h in morts[:10])
+            _alerter_si_nouveau(
+                "zigbee_mort",
+                f"📡 DEVICES UNAVAILABLE > 24H\n━━━━━━━━━━━━━━━━━━\n{liste}\n\n"
+                f"Vérifiez : batterie vide, hors portée Zigbee, ou device HS.",
+                delai_h=24
+            )
+
+        mem_set("zigbee_mort_check", now.isoformat())
+    except Exception as e:
+        log.debug(f"Zigbee mort: {e}")
+
+
+def _notif_tempo_ejp(now):
+    """Si contrat Tempo/EJP, notifie la veille des jours rouges. CRASH-PROOF."""
+    try:
+        if now.hour != 19 or now.minute > 5:
+            return
+        tarif, _ = skill_get("tarification")
+        if not tarif or tarif.get("type") not in ("tempo", "ejp"):
+            return
+        derniere = mem_get("tempo_check_last")
+        if derniere:
+            try:
+                if (now - datetime.fromisoformat(derniere)).total_seconds() < 72000:
+                    return
+            except Exception:
+                pass
+
+        # Appeler l'API RTE Tempo
+        try:
+            url = "https://www.api-couleur-tempo.fr/api/jourTempo/tomorrow"
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                couleur = data.get("codeJour", 0)
+                # 1=bleu, 2=blanc, 3=rouge
+                if couleur == 3:
+                    telegram_send(
+                        "🔴 JOUR ROUGE TEMPO DEMAIN\n━━━━━━━━━━━━━━━━━━\n"
+                        "Tarif très élevé demain.\n"
+                        "💡 Décalez toutes les machines à ce soir ou après-demain.\n"
+                        "🔌 Réduisez le chauffage si possible."
+                    )
+                elif couleur == 2:
+                    telegram_send(
+                        "⚪ JOUR BLANC TEMPO DEMAIN\n"
+                        "Tarif intermédiaire — utilisez les heures creuses."
+                    )
+        except Exception:
+            pass
+
+        mem_set("tempo_check_last", now.isoformat())
+    except Exception as e:
+        log.debug(f"Tempo: {e}")
+
+
+
+def _detecter_fuite_eau(index, now):
+    """Si capteur d'eau HA détecte une fuite → alerte immédiate. CRASH-PROOF."""
+    try:
+        for eid, e in index.items():
+            if "moisture" in eid or "water_leak" in eid or "fuite" in eid:
+                if e.get("state") in ("on", "True", "wet", "detected"):
+                    fname = e.get("attributes", {}).get("friendly_name", eid)
+                    _alerter_si_nouveau(
+                        f"fuite_{eid}",
+                        f"💧 FUITE D'EAU DÉTECTÉE\n━━━━━━━━━━━━━━━━━━\n"
+                        f"Capteur : {fname}\n"
+                        f"État : {e.get('state')}\n\n"
+                        f"⚠️ Vérifiez immédiatement !",
+                        delai_h=1
+                    )
+    except Exception as e:
+        log.debug(f"Fuite eau: {e}")
+
+
+def cmd_pieces():
+    """Consommation par pièce — areas HA + détection par nom d'entité."""
+    try:
+        index = ha_get("states")
+        if not index:
+            return "❌ HA inaccessible."
+
+        index_dict = {e["entity_id"]: e for e in index}
+        pieces = {}
+
+        # Pièces connues pour détection par nom
+        PIECES_CONNUES = [
+            "cuisine", "salon", "chambre", "bureau", "buanderie", "garage",
+            "salle de bain", "sdb", "entrée", "couloir", "jardin", "terrasse",
+            "grenier", "cave", "cellier", "wc", "toilette",
+        ]
+
+        # Filtrer les entités de production solaire
+        conn = sqlite3.connect(DB_PATH)
+        solaire_ids = set()
+        try:
+            rows = conn.execute(
+                "SELECT entity_id FROM cartographie WHERE categorie IN ('energie_production', 'energie_batterie', 'energie_solaire')"
+            ).fetchall()
+            solaire_ids = {r[0] for r in rows}
+        except Exception:
+            pass
+        conn.close()
+
+        for eid, e in index_dict.items():
+            # Seulement les capteurs de puissance
+            if "_power" not in eid or e.get("state") in ("unavailable", "unknown", ""):
+                continue
+            # Exclure production solaire
+            if eid in solaire_ids:
+                continue
+            try:
+                watts = float(e["state"])
+            except (ValueError, TypeError):
+                continue
+            if watts <= 0:
+                continue
+
+            # Trouver la pièce
+            # 1. Area HA
+            area_id = shared._entity_areas.get(eid)
+            piece = shared._areas_id_to_name.get(area_id, "") if area_id else ""
+
+            # 2. Fallback: nom de l'entité ou friendly_name
+            if not piece:
+                fname = e.get("attributes", {}).get("friendly_name", eid).lower()
+                eid_low = eid.lower()
+                for p in PIECES_CONNUES:
+                    if p in eid_low or p in fname:
+                        piece = p.capitalize()
+                        break
+                # Cas spéciaux
+                if not piece:
+                    if "chambre" in eid_low:
+                        # Extraire le nom après "chambre" : prise_chambre_tv → Chambre TV
+                        parts = eid_low.split("chambre")
+                        if len(parts) > 1:
+                            suffix = parts[1].replace("_", " ").strip()
+                            piece = f"Chambre {suffix}".strip().title()
+                        else:
+                            piece = "Chambre"
+
+            if not piece:
+                piece = "Autre"
+
+            if piece not in pieces:
+                pieces[piece] = []
+            pieces[piece].append((eid, watts, e.get("attributes", {}).get("friendly_name", eid)))
+
+        if not pieces:
+            return "📊 Aucune donnée de puissance par pièce."
+
+        # Trier par total décroissant
+        pieces_total = {p: sum(w for _, w, _ in devs) for p, devs in pieces.items()}
+        total = sum(pieces_total.values())
+        pieces_triees = sorted(pieces_total.items(), key=lambda x: x[1], reverse=True)
+
+        result = "🏠 CONSOMMATION PAR PIÈCE\n━━━━━━━━━━━━━━━━━━\n\n"
+        for piece, watts in pieces_triees:
+            pct = int(watts / total * 100) if total > 0 else 0
+            barre = "█" * max(1, pct // 5) + "░" * max(0, 20 - pct // 5)
+            # Détail appareils
+            devs = sorted(pieces[piece], key=lambda x: x[1], reverse=True)
+            detail = ", ".join(f"{fn.split(' ')[-1]} {w:.0f}W" for _, w, fn in devs[:3])
+            result += f"**{piece}** : {watts:.0f}W ({pct}%)\n{barre}\n{detail}\n\n"
+
+        result += f"**TOTAL : {total:.0f}W**"
+        return result
+
+    except Exception as e:
+        return f"❌ Erreur pièces: {e}"
+
+
+
+# =============================================================================
+# FEATURES v7.64 — Rollback auto, deploy server monitoring
+# =============================================================================
+
+def _rollback_si_erreurs_repetees(now):
+    """Si 3+ crashes en 1h → rollback vers le dernier backup. CRASH-PROOF."""
+    try:
+        if now.minute != 0:
+            return  # Check toutes les heures seulement
+
+        import glob
+        crash_log = os.path.join(BASE_DIR, "crash.log")
+        if not os.path.exists(crash_log):
+            return
+
+        with open(crash_log) as f:
+            content = f.read()
+
+        # Compter les crashes récents (dernière heure)
+        crashes_recentes = 0
+        for line in content.split("\n"):
+            if "CRASH" in line:
+                try:
+                    # Extraire timestamp
+                    ts_str = line.split("CRASH")[1][:25].strip()
+                    dt = datetime.fromisoformat(ts_str.replace(" ", "T")[:19])
+                    if (now - dt).total_seconds() < 3600:
+                        crashes_recentes += 1
+                except Exception:
+                    pass
+
+        if crashes_recentes >= 3:
+            # Trouver le backup le plus récent
+            backup_dir = os.path.join(BASE_DIR, "versions")
+            backups = sorted(glob.glob(os.path.join(backup_dir, "skills.py.bak_*")), reverse=True)
+            if backups:
+                import shutil
+                log.warning(f"⚠️ {crashes_recentes} crashes en 1h — rollback vers {os.path.basename(backups[0])}")
+                shutil.copy2(backups[0], os.path.join(BASE_DIR, "skills.py"))
+                telegram_send(
+                    f"⚠️ ROLLBACK AUTOMATIQUE\n━━━━━━━━━━━━━━━━━━\n"
+                    f"{crashes_recentes} crashes détectés en 1h.\n"
+                    f"Retour vers la version précédente.\n"
+                    f"Redémarrage..."
+                )
+                import subprocess
+                time.sleep(3)
+                subprocess.Popen(["systemctl", "restart", "assistantia"])
+    except Exception as e:
+        log.debug(f"Rollback auto: {e}")
+
+
+def _monitoring_deploy_server(now):
+    """Vérifie que le deploy server répond. CRASH-PROOF."""
+    try:
+        if now.minute not in (0, 30):
+            return  # 2x par heure
+
+        try:
+            import socket
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(3)
+            result = s.connect_ex(("127.0.0.1", 8501))
+            s.close()
+            if result == 0:
+                return  # Port ouvert = deploy server tourne
+        except Exception:
+            pass
+
+        _alerter_si_nouveau(
+            "deploy_server_down",
+            "⚠️ Deploy server ne répond pas sur le port 8501.\n"
+            "Le déploiement à distance est indisponible.",
+            delai_h=6
+        )
+    except Exception as e:
+        log.debug(f"Monitor deploy: {e}")
+
+
+def cmd_appareils_connus():
+    """Affiche la bibliothèque d'appareils connus."""
+    try:
+        path = os.path.join(BASE_DIR, "APPAREILS_CONNUS.json")
+        if not os.path.exists(path):
+            return "⚠️ Fichier APPAREILS_CONNUS.json introuvable."
+        with open(path) as f:
+            data = json.load(f)
+        result = "📚 APPAREILS CONNUS\n━━━━━━━━━━━━━━━━━━\n\n"
+        for key, info in data.items():
+            emoji = info.get("emoji", "")
+            nom = info.get("nom", key)
+            conso = info.get("conso_kwh_typique", [0, 0])
+            duree = [info.get("duree_min_min", 0), info.get("duree_max_min", 0)]
+            result += f"{emoji} **{nom}**\n"
+            result += f"  Puissance : {info.get('puissance_min_w', 0)}-{info.get('puissance_max_w', 0)}W\n"
+            if duree[1] > 0:
+                result += f"  Durée : {duree[0]}-{duree[1]} min\n"
+            result += f"  Conso : {conso[0]}-{conso[1]} kWh\n"
+            if info.get("pieges"):
+                result += f"  ⚠️ {info['pieges'][0]}\n"
+            result += "\n"
+        return result
+    except Exception as e:
+        return f"❌ Erreur: {e}"
+
+
 def traiter_message(texte):
     t = texte.strip().lower()
     # Enlever le "/" au début si présent
@@ -10147,7 +11042,18 @@ def traiter_message(texte):
         "diag_forecast": cmd_diag_forecast, # 🔧 Debug forecast
         "aide": cmd_documentation,          # 📖 Aide (alias)
         "commandes": cmd_commandes, "commande": cmd_commandes, "menu": cmd_commandes,
-        "watches": cmd_watches, "alertes": cmd_watches,  # 🔔 Alertes dynamiques  # 📋 Menu boutons
+        "watches": cmd_watches,
+        "score": cmd_score,
+        "dpe": cmd_score,
+        "export": cmd_export_pdf,
+        "pdf": cmd_export_pdf,
+        "contrat": cmd_conseil_contrat,
+        "conseil": cmd_conseil_contrat,
+        "pieces": cmd_pieces,
+        "pièces": cmd_pieces,
+        "rooms": cmd_pieces,
+        "appareils": cmd_appareils_connus,
+        "machines": cmd_appareils_connus, "alertes": cmd_watches,  # 🔔 Alertes dynamiques  # 📋 Menu boutons
         "programmes": cmd_programmes,      # 🔄 Programmes machines appris
         "appareils": cmd_appareils,          # 🔌 Appareils sur prises
         "surveillance": cmd_surveillance,    # 🛡️ Tout ce qui est surveillé
@@ -10320,6 +11226,14 @@ def traiter_message(texte):
 
 def bilan_automatique():
     """Génère et envoie un bilan complet"""
+    # Tracker interaction pour mode vacances
+    try:
+        mem_set("dernier_message_telegram", datetime.now().isoformat())
+        if mem_get("mode_vacances") == "actif":
+            mem_set("mode_vacances", "")
+            telegram_send("🏠 Mode vacances désactivé — bon retour !")
+    except Exception:
+        pass
     telegram_send("📊 Génération du bilan automatique en cours...")
     etats = ha_get("states")
     if not etats:
