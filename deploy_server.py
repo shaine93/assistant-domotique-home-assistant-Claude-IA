@@ -15,11 +15,11 @@ import time
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-CONFIG_PATH = ""+os.path.join(BASE_DIR,"config.json"
-SCRIPT_PATH = ""+os.path.join(BASE_DIR,"assistant.py"
-ASSISTANT_DIR = "/home/user/assistant"
-VERSIONS_DIR = ""+os.path.join(BASE_DIR,"versions"
-DEPLOY_LOG = ""+os.path.join(BASE_DIR,"deploy.log"
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+SCRIPT_PATH = os.path.join(BASE_DIR, "assistant.py")
+ASSISTANT_DIR = BASE_DIR
+VERSIONS_DIR = os.path.join(BASE_DIR, "versions")
+DEPLOY_LOG = os.path.join(BASE_DIR, "deploy.log")
 PORT = 8501
 
 ALLOWED_EXTENSIONS = {".py", ".md", ".txt", ".json", ".yaml", ".yml", ".sh", ".cfg", ".ini"}
@@ -274,7 +274,7 @@ def action_status():
 
 def action_logs(n=50):
     try:
-        with open(""+os.path.join(BASE_DIR,"assistant.log", "r") as f:
+        with open(os.path.join(BASE_DIR, "assistant.log"), "r") as f:
             lines = f.readlines()
         return {"status": "ok", "lines": [l.rstrip() for l in lines[-n:]], "total_lines": len(lines)}
     except Exception as e:
@@ -293,6 +293,38 @@ class DeployHandler(BaseHTTPRequestHandler):
             self._respond(200, action_read(self.path[6:]))
         elif self.path == "/status":
             self._respond(200, action_status())
+        elif self.path.startswith("/ask"):
+            # API vocale pour Google Home / Alexa
+            import urllib.parse
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            question = params.get("q", [""])[0]
+            if not question:
+                self._respond(400, {"status": "error", "message": "Paramètre q manquant"})
+            else:
+                try:
+                    # Écrire la question dans un fichier, l'assistant la traite
+                    q_path = os.path.join(ASSISTANT_DIR, "vocal_question.json")
+                    a_path = os.path.join(ASSISTANT_DIR, "vocal_answer.json")
+                    import time as _t
+                    with open(q_path, "w") as f:
+                        json.dump({"q": question, "ts": _t.time()}, f)
+                    # Attendre la réponse (max 30s)
+                    for _ in range(60):
+                        _t.sleep(0.5)
+                        if os.path.exists(a_path):
+                            try:
+                                with open(a_path) as f:
+                                    answer = json.load(f)
+                                if answer.get("ts", 0) > _t.time() - 35:
+                                    os.remove(a_path)
+                                    self._respond(200, answer)
+                                    return
+                            except Exception:
+                                pass
+                    self._respond(504, {"status": "error", "message": "Timeout"})
+                except Exception as e:
+                    self._respond(500, {"status": "error", "message": str(e)})
         elif self.path.startswith("/logs"):
             n = 50
             if "n=" in self.path:

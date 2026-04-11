@@ -38,13 +38,13 @@ def backup_sqlite():
 
 def keepalive():
     while True:
-        with open(""+os.path.join(BASE_DIR,"keepalive.log", "a") as f:
+        with open(os.path.join(BASE_DIR, "keepalive.log"), "a") as f:
             f.write(f"{datetime.now().isoformat()} keepalive\n")
         try:
-            with open(""+os.path.join(BASE_DIR,"keepalive.log", "r") as f:
+            with open(os.path.join(BASE_DIR, "keepalive.log"), "r") as f:
                 lignes = f.readlines()
             if len(lignes) > 500:
-                with open(""+os.path.join(BASE_DIR,"keepalive.log", "w") as f:
+                with open(os.path.join(BASE_DIR, "keepalive.log"), "w") as f:
                     f.writelines(lignes[-200:])
         except Exception:
             pass
@@ -586,6 +586,76 @@ def surveillance_batteries():
         time.sleep(60)
 
 
+
+# =============================================================================
+# API VOCALE — Endpoint HTTP pour Google Home / Alexa via HA
+# Port 8502 — GET /ask?q=économies → JSON {response: "..."}
+# =============================================================================
+
+def _api_vocale_server():
+    """Serveur HTTP léger pour requêtes vocales. CRASH-PROOF."""
+    try:
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        import urllib.parse
+
+        class VocalHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass  # Silencieux
+
+            def do_GET(self):
+                if self.path.startswith("/ask"):
+                    parsed = urllib.parse.urlparse(self.path)
+                    params = urllib.parse.parse_qs(parsed.query)
+                    question = params.get("q", [""])[0]
+
+                    if not question:
+                        self._json(400, {"error": "Paramètre q manquant"})
+                        return
+
+                    # Vérifier token simple (optionnel)
+                    auth = self.headers.get("Authorization", "")
+                    api_token = shared.CFG.get("vocal_api_token", "")
+                    if api_token and auth != f"Bearer {api_token}":
+                        self._json(401, {"error": "Non autorisé"})
+                        return
+
+                    try:
+                        log.info(f"🎙️ API vocale: {question}")
+                        reponse = traiter_message(question)
+                        # Nettoyer le markdown pour la synthèse vocale
+                        reponse_tts = reponse.replace("**", "").replace("━", "").replace("═", "")
+                        reponse_tts = reponse_tts.replace("\n\n", ". ").replace("\n", ". ")
+                        # Limiter à 500 chars pour TTS
+                        if len(reponse_tts) > 500:
+                            reponse_tts = reponse_tts[:497] + "..."
+                        self._json(200, {
+                            "response": reponse,
+                            "tts": reponse_tts,
+                            "question": question
+                        })
+                    except Exception as e:
+                        log.error(f"API vocale: {e}")
+                        self._json(500, {"error": str(e)})
+
+                elif self.path == "/health":
+                    self._json(200, {"status": "ok"})
+                else:
+                    self._json(404, {"error": "Not found"})
+
+            def _json(self, code, data):
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps(data, ensure_ascii=False).encode())
+
+        server = HTTPServer(("0.0.0.0", 8502), VocalHandler)
+        log.info("🎙️ API vocale démarrée sur le port 8502")
+        server.serve_forever()
+    except Exception as e:
+        log.error(f"API vocale: {e}")
+
+
 def main():
     # global canal_verrouille  # → shared
     log.info(f"=== AssistantIA {VERSION} démarrage ===")
@@ -759,6 +829,12 @@ def main():
         pass
 
     log.info(f"✅ 8 threads démarrés")
+
+    # API vocale pour Google Home / Alexa
+    try:
+        threading.Thread(target=_api_vocale_server, daemon=True).start()
+    except Exception:
+        pass
     mem_set("envoyer_md_maintenant", "oui")
 
     # Premier démarrage : questionnaire tarif si pas encore configuré
@@ -901,6 +977,27 @@ def main():
                         telegram_send(reponse[i:i+4000], force=True)
                 else:
                     telegram_send(reponse, force=True)
+
+            # API vocale — check question Google Home/Alexa (chaque boucle ~2s)
+            try:
+                _q_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vocal_question.json")
+                if os.path.exists(_q_path):
+                    with open(_q_path) as _qf:
+                        _q_data = json.load(_qf)
+                    os.remove(_q_path)
+                    if time.time() - _q_data.get("ts", 0) < 35:
+                        _question = _q_data.get("q", "")
+                        if _question:
+                            _reponse = traiter_message(_question)
+                            _tts = _reponse.replace("**", "").replace("━", "").replace("═", "")
+                            _tts = _tts.replace("\n\n", ". ").replace("\n", ". ")
+                            if len(_tts) > 500:
+                                _tts = _tts[:497] + "..."
+                            _a_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vocal_answer.json")
+                            with open(_a_path, "w") as _af:
+                                json.dump({"response": _reponse, "tts": _tts, "ts": time.time()}, _af, ensure_ascii=False)
+            except Exception:
+                pass
 
             time.sleep(shared.CFG.get("poll_interval_sec", 2))
 

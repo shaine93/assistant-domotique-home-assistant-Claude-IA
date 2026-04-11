@@ -3589,6 +3589,12 @@ def surveillance_monitoring():
             except Exception:
                 pass
 
+            # Google Home / Alexa vocal scripts
+            try:
+                _check_vocal_scripts(index, now)
+            except Exception as _e_vocal:
+                log.error(f"Vocal scripts error: {_e_vocal}")
+
             # Fuite d'eau
             try:
                 _detecter_fuite_eau(index, now)
@@ -3612,6 +3618,7 @@ def surveillance_monitoring():
                 _notif_tempo_ejp(now)
             except Exception:
                 pass
+
 
             # Rollback auto (1x/h)
             try:
@@ -10987,6 +10994,73 @@ def cmd_appareils_connus():
     except Exception as e:
         return f"❌ Erreur: {e}"
 
+
+
+# =============================================================================
+# GOOGLE HOME / ALEXA — Détection commandes vocales via scripts HA
+# =============================================================================
+
+_vocal_scripts_last = {}
+
+def _check_vocal_scripts(index, now):
+    """Détecte l'exécution des scripts HA assistantia_* → traite + TTS Nest Hub. CRASH-PROOF."""
+    global _vocal_scripts_last
+    try:
+        scripts_map = {
+            "script.assistantia_energie": "énergie",
+            "script.assistantia_score": "score",
+            "script.assistantia_debug": "debug",
+            "script.assistantia_pieces": "pieces",
+            "script.assistantia_contrat": "contrat",
+        }
+
+        found = 0
+        for eid in scripts_map:
+            if eid in index:
+                found += 1
+        if found == 0:
+            return  # Pas de scripts HA trouvés
+
+        for eid, cmd in scripts_map.items():
+            e = index.get(eid)
+            if not e:
+                continue
+            last_triggered = e.get("attributes", {}).get("last_triggered", "")
+            if last_triggered == "None":
+                last_triggered = ""
+            prev = _vocal_scripts_last.get(eid, "")
+
+            if last_triggered and last_triggered != prev:
+                _vocal_scripts_last[eid] = last_triggered
+                if not prev:
+                    continue
+
+                log.info(f"🎙️ Google Home: {cmd} (trigger: {last_triggered[:19]})")
+
+                try:
+                    reponse = traiter_message(cmd)
+                    tts = reponse.replace("**", "").replace("━", "").replace("═", "")
+                    tts = tts.replace("\n\n", ". ").replace("\n", ". ")
+                    tts = tts.replace("  ", " ").strip()
+                    if len(tts) > 400:
+                        tts = tts[:397] + "..."
+
+                    media_players = CFG.get("tts_media_players", ["media_player.chambre_philippe"])
+                    for mp in media_players:
+                        try:
+                            ha_post("services/tts/google_translate_say", {
+                                "entity_id": mp,
+                                "message": tts
+                            })
+                        except Exception:
+                            pass
+
+                    log.info(f"🎙️ TTS envoyé: {tts[:80]}...")
+                except Exception as e:
+                    log.error(f"Vocal script error: {e}")
+
+    except Exception as e:
+        log.debug(f"Check vocal scripts: {e}")
 
 def traiter_message(texte):
     t = texte.strip().lower()

@@ -58,11 +58,11 @@ E3
 
 INFRASTRUCTURE :
 - VM Google Cloud : user@instance-20260226-111134 / 34.168.105.47
-- Script : "+os.path.join(BASE_DIR,"assistant.py (~10454 lignes, v1.5.0)
+- Script : assistant.py (~10454 lignes, v1.5.0)
 - Deploy Server : port 8501, HMAC-SHA256
 - Deploy secret : 45605531a18b27dca47cc640701f8c7c6571cdba33b0876b152e1e31be161ec4
-- DB : "+os.path.join(BASE_DIR,"memory.db (21 tables)
-- MD : "+os.path.join(BASE_DIR,"Cahier_des_Charges.md
+- DB : memory.db (21 tables)
+- MD : Cahier_des_Charges.md
 
 DEPLOY SERVER :
 - GET (Bearer token) : /ping /status /read /read/<path> /logs?n=N /ls

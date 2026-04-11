@@ -1,0 +1,10 @@
+# Configuration Google Home / Alexa via Home Assistant
+# Les scripts sont créés automatiquement par AssistantIA dans HA.
+#
+# Commandes Google Home :
+#   "Hey Google, exécute AssistantIA énergie"
+#   "Hey Google, exécute AssistantIA score"  
+#   "Hey Google, exécute AssistantIA debug"
+#
+# La réponse est parlée sur votre Nest Hub / Google Home.
+# Configurez le media_player dans config.json : "tts_media_players": ["media_player.salon"]
