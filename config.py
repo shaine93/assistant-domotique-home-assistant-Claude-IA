@@ -57,6 +57,13 @@ TYPES_APPAREILS = {
     "four": "🔥 Four",
     "coupe_veille": "🔇 Coupe-veille",
     "monitoring_energie": "📊 Monitoring énergie",
+    "ballon_thermo": "🔥 Ballon thermodynamique",
+    "borne_ev": "🔌 Borne recharge VE",
+    "seche_serviettes": "🛁 Sèche-serviettes",
+    "pompe_piscine": "🏊 Pompe piscine",
+    "chauffe_eau": "♨️ Chauffe-eau",
+    "climatisation": "❄️ Climatisation",
+    "radiateur": "🌡️ Radiateur électrique",
     "autre": "🔌 Autre (nommer)",
     "ignorer": "⬜ Ignorer",
 }

@@ -957,8 +957,8 @@ La réponse est parlée via TTS sur tous les media_players configurés dans `con
   Résultat attendu : **10/10 sans incohérence**. Sinon pas de bêta.
 - [x] **Issues templates** : bug report, feature request, nouveau fournisseur
 - [x] **Auto-update silencieux** : le script vérifie GitHub toutes les 24h, télécharge la nouvelle version, valide la syntaxe, backup l'ancienne, remplace, restart. L'utilisateur ne fait rien. Jamais de `git pull`.
-- [ ] **GitHub Actions CI** : pytest automatique à chaque push
-- [ ] **Releases automatiques** : tag → release → CHANGELOG
+- [x] **GitHub Actions CI** : pytest automatique à chaque push
+- [x] **Releases automatiques** : tag → release → CHANGELOG
 
 #### 📊 Priorité 2 — Fonctionnalités produit
 
@@ -977,10 +977,10 @@ La réponse est parlée via TTS sur tous les media_players configurés dans `con
 
 Le vrai avantage : chaque installation apprend → les leçons sont partagées → tout le monde progresse.
 
-- [ ] **Leçons fondatrices partagées** : les pièges découverts par un testeur (ex: pause sèche-linge 38 min) sont intégrés au repo et profitent à tous via `git pull`
+- [x] **Leçons fondatrices partagées** : les pièges découverts par un testeur (ex: pause sèche-linge 38 min) sont intégrés au repo et profitent à tous via `git pull`
 - [x] **Bibliothèque de profils appareils** : ballon thermodynamique, borne de recharge, sèche-serviettes, pompe piscine, four, cafetière — chaque testeur ajoute un type
 - [x] **Fichier APPAREILS_CONNUS.json** : signatures de consommation types (durée min/max, puissance, pauses connues) partagées entre installations
-- [ ] **Nouveaux types dans le questionnaire appareils** : ballon thermodynamique, borne EV, sèche-serviettes, pompe piscine, chauffe-eau
+- [x] **Nouveaux types dans le questionnaire appareils** : ballon thermodynamique, borne EV, sèche-serviettes, pompe piscine, chauffe-eau
 - [ ] **Ballon thermodynamique** (pince ampèremétrique) : profil chauffe/veille, corrélation température ext, optimisation HC/solaire, détection anomalie (chauffe trop longue = fuite eau chaude ?)
 - [ ] **Remontée anonyme opt-in** : statistiques d'économies anonymisées → tableau comparatif (ROI moyen, kWh économisés, meilleur tarif)
 
