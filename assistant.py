@@ -723,6 +723,9 @@ def main():
     # Dernier code < 24h → auto-déverrouillé. Sinon → SMS.
     dernier_code = mem_get("dernier_deverrouillage")
     skip_sms = False
+    if MODE == "DEV":
+        skip_sms = True
+        log.info("🔓 Mode DEV — canal ouvert sans SMS")
     if dernier_code:
         try:
             dt = datetime.strptime(dernier_code[:19], "%Y-%m-%dT%H:%M:%S")
@@ -977,27 +980,6 @@ def main():
                         telegram_send(reponse[i:i+4000], force=True)
                 else:
                     telegram_send(reponse, force=True)
-
-            # API vocale — check question Google Home/Alexa (chaque boucle ~2s)
-            try:
-                _q_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vocal_question.json")
-                if os.path.exists(_q_path):
-                    with open(_q_path) as _qf:
-                        _q_data = json.load(_qf)
-                    os.remove(_q_path)
-                    if time.time() - _q_data.get("ts", 0) < 35:
-                        _question = _q_data.get("q", "")
-                        if _question:
-                            _reponse = traiter_message(_question)
-                            _tts = _reponse.replace("**", "").replace("━", "").replace("═", "")
-                            _tts = _tts.replace("\n\n", ". ").replace("\n", ". ")
-                            if len(_tts) > 500:
-                                _tts = _tts[:497] + "..."
-                            _a_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vocal_answer.json")
-                            with open(_a_path, "w") as _af:
-                                json.dump({"response": _reponse, "tts": _tts, "ts": time.time()}, _af, ensure_ascii=False)
-            except Exception:
-                pass
 
             time.sleep(shared.CFG.get("poll_interval_sec", 2))
 

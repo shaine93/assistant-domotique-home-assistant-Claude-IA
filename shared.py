@@ -193,11 +193,9 @@ HA_DOMAINES_AUTORISES = {"light", "switch", "lock", "cover", "climate", "fan", "
 HA_TOOLS = [
     {
         "name": "ha_call_service",
-        "description": "Appelle un service Home Assistant pour agir sur un appareil. "
-                       "Domaines : lock (lock/unlock), light (turn_on/turn_off/toggle), "
-                       "switch (turn_on/turn_off/toggle), cover (open_cover/close_cover), "
-                       "climate (set_temperature/set_hvac_mode/turn_on/turn_off), "
-                       "fan, vacuum, media_player, scene, script.",
+        "description": "Appelle un service Home Assistant pour contrôler un appareil. "
+                       "Utilise DIRECTEMENT l'entity_id visible dans l'état HA. "
+                       "NE DEMANDE JAMAIS confirmation textuelle — le système gère la confirmation par boutons.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -207,19 +205,67 @@ HA_TOOLS = [
                 },
                 "service": {
                     "type": "string",
-                    "description": "Service : turn_on, turn_off, toggle, lock, unlock, open_cover, close_cover, etc."
+                    "description": "Service : turn_on, turn_off, toggle, lock, unlock, open_cover, close_cover, set_temperature, etc."
                 },
                 "entity_id": {
                     "type": "string",
-                    "description": "Entity ID complet, ex: lock.porte_entree, light.salon"
+                    "description": "Entity ID exact (ex: lock.porte_entree, light.salon)"
                 },
                 "data": {
                     "type": "object",
-                    "description": "Données optionnelles : brightness, temperature, hvac_mode, etc.",
+                    "description": "Données optionnelles (brightness, temperature, etc.)",
                     "default": {}
                 }
             },
             "required": ["domain", "service", "entity_id"]
+        }
+    },
+    {
+        "name": "ha_create_automation",
+        "description": "Crée une automatisation dans Home Assistant. Cherche les entity_id exacts dans l'état HA fourni. Ne demande JAMAIS à l'utilisateur de chercher les entités.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "alias": {"type": "string", "description": "Nom de l'automatisation"},
+                "description": {"type": "string", "description": "Description de l'automatisation"},
+                "trigger": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Triggers HA (ex: [{platform: numeric_state, entity_id: sensor.xxx, above: 99}])"
+                },
+                "condition": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Conditions optionnelles"
+                },
+                "action": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Actions HA (ex: [{service: switch.turn_on, target: {entity_id: switch.xxx}}])"
+                },
+                "mode": {"type": "string", "description": "single, restart, queued, parallel"}
+            },
+            "required": ["alias", "trigger", "action"]
+        }
+    },
+    {
+        "name": "ha_search_entities",
+        "description": "Recherche des entités dans Home Assistant par mot-clé. "
+                       "Utilise cet outil AVANT de créer une automatisation pour trouver les entity_id exacts. "
+                       "Retourne tous les entity_id, états et attributs correspondants.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "keyword": {
+                    "type": "string",
+                    "description": "Mot-clé de recherche (ex: anker, batterie, température, lumière, serrure, volet)"
+                },
+                "domain": {
+                    "type": "string",
+                    "description": "Filtrer par domaine HA (optionnel): sensor, switch, light, cover, climate, lock, number, select, binary_sensor, automation"
+                }
+            },
+            "required": ["keyword"]
         }
     },
     {
@@ -234,32 +280,23 @@ HA_TOOLS = [
             "properties": {
                 "entity_pattern": {
                     "type": "string",
-                    "description": "Pattern pour les entity_id à surveiller. Peut être un entity_id exact "
-                                   "(sensor.ecu_lifetime_energy) ou un pattern avec * "
-                                   "(sensor.ecu_*_power pour tous les micro-onduleurs APSystems). "
-                                   "Utilise les entity_id visibles dans l'état HA."
+                    "description": "Entity ID ou pattern glob (ex: sensor.ecu_* pour tous les onduleurs)"
                 },
                 "condition": {
                     "type": "string",
-                    "enum": ["unavailable", "offline", "equals", "not_equals", "above", "below", "changes"],
-                    "description": "Condition de déclenchement : "
-                                   "unavailable/offline = entité hors ligne, "
-                                   "equals/not_equals = état égal/différent de state_value, "
-                                   "above/below = valeur numérique au-dessus/en-dessous de state_value, "
-                                   "changes = tout changement d'état"
+                    "description": "unavailable, offline, equals, not_equals, above, below, changes"
                 },
                 "state_value": {
                     "type": "string",
-                    "description": "Valeur de comparaison pour equals/not_equals/above/below. Vide pour unavailable/offline/changes.",
-                    "default": ""
+                    "description": "Valeur seuil (ex: 95 pour above 95, on pour equals on). Vide pour unavailable/offline/changes."
                 },
                 "message": {
                     "type": "string",
-                    "description": "Message d'alerte à envoyer. Utilise {entity_id}, {state}, {friendly_name} comme variables."
+                    "description": "Message d'alerte. Variables : {entity_id}, {state}, {friendly_name}"
                 },
                 "cooldown_min": {
-                    "type": "integer",
-                    "description": "Intervalle minimum entre deux alertes identiques (en minutes). Défaut: 60.",
+                    "type": "number",
+                    "description": "Délai minimum entre deux alertes identiques (en minutes). Défaut: 60.",
                     "default": 60
                 }
             },
@@ -2109,7 +2146,22 @@ def appel_claude(message_utilisateur, contexte_ha=None):
         return "⚠️ Budget API mensuel atteint."
 
     comportement = charger_comportement()
-    system_prompt = comportement
+    # Instructions autonomes
+    system_prompt = comportement + """
+RÈGLES CRITIQUES :
+- Tu as accès à TOUTES les entités HA dans l'état ci-dessous. CHERCHE les entity_id toi-même.
+- NE DEMANDE JAMAIS à l'utilisateur de chercher des entités — tu as les données.
+- Pour une action simple (allumer/éteindre), utilise ha_call_service DIRECTEMENT.
+- Pour surveiller, utilise ha_create_watch DIRECTEMENT.
+- Tu es AUTONOME : l'utilisateur donne l'objectif, tu trouves les moyens.
+
+AUTOMATISATIONS — MÉTHODE OBLIGATOIRE :
+1. D'abord, utilise ha_search_entities pour trouver les entités liées à la demande
+2. Avec les résultats, utilise ha_create_automation pour créer l'automatisation
+3. Le système affiche un résumé avec boutons Valider/Modifier/Annuler
+- NE POSE JAMAIS DE QUESTIONS. NE DEMANDE JAMAIS DE PRÉCISIONS. AGIS.
+- Fonctionne avec TOUTES les intégrations HA : Anker, Shelly, Zigbee, Tuya, etc.
+"""
     if contexte_ha:
         system_prompt += f"\n\n=== ÉTAT HOME ASSISTANT ===\n{contexte_ha}"
 
@@ -2119,9 +2171,17 @@ def appel_claude(message_utilisateur, contexte_ha=None):
 
     try:
         client = anthropic.Anthropic(api_key=CFG["anthropic_api_key"])
+        # Sonnet pour requêtes complexes
+        _kw = ["automatisation", "automation", "crée une", "créer", "configure",
+            "délestage", "scénario", "routine", "quand la batterie",
+            "si la température", "programme un", "yaml", "script ha"]
+        _use_sonnet = any(k in message_utilisateur.lower() for k in _kw)
+        _model = "claude-sonnet-4-20250514" if _use_sonnet else "claude-haiku-4-5-20251001"
+        if _use_sonnet:
+            log.info(f"🧠 Sonnet activé pour: {message_utilisateur[:50]}")
         r = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1000,
+            model=_model,
+            max_tokens=2000 if _use_sonnet else 1000,
             system=[{
                 "type": "text",
                 "text": system_prompt,
@@ -2141,11 +2201,66 @@ def appel_claude(message_utilisateur, contexte_ha=None):
         texte_reponse = ""
         action_demandee = None
         watch_demandee = None
+        automation_demandee = None
         for block in r.content:
             if block.type == "text":
                 texte_reponse += block.text
             elif block.type == "tool_use" and block.name == "ha_call_service":
                 action_demandee = block.input
+            elif block.type == "tool_use" and block.name == "ha_search_entities":
+                search_input = block.input
+                keyword = search_input.get("keyword", "").lower()
+                domain_filter = search_input.get("domain", "")
+                # Chercher dans HA
+                try:
+                    all_states = ha_get("states") or []
+                    resultats = []
+                    for e in all_states:
+                        eid = e["entity_id"]
+                        fname = e.get("attributes", {}).get("friendly_name", "")
+                        state = e.get("state", "")
+                        if keyword in eid.lower() or keyword in fname.lower():
+                            if domain_filter and not eid.startswith(domain_filter + "."):
+                                continue
+                            attrs = e.get("attributes", {})
+                            info = f"{eid} = {state}"
+                            if fname:
+                                info += f" ({fname})"
+                            # Ajouter les attributs utiles
+                            for k in ["unit_of_measurement", "device_class", "min", "max", "options"]:
+                                if k in attrs:
+                                    info += f" [{k}={attrs[k]}]"
+                            resultats.append(info)
+                    # Renvoyer les résultats à Claude pour continuer
+                    search_result = f"Résultats pour '{keyword}':\n" + "\n".join(resultats[:30]) if resultats else f"Aucune entité trouvée pour '{keyword}'"
+                    # Faire un second appel avec les résultats
+                    messages_suite = messages + [
+                        {"role": "assistant", "content": [{"type": "tool_use", "id": block.id, "name": "ha_search_entities", "input": search_input}]},
+                        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": block.id, "content": search_result}]}
+                    ]
+                    r2 = client.messages.create(
+                        model=_model,
+                        max_tokens=2000 if _use_sonnet else 1000,
+                        system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+                        messages=messages_suite,
+                        tools=HA_TOOLS
+                    )
+                    log_token_usage(r2.usage.input_tokens, r2.usage.output_tokens)
+                    # Traiter la réponse de suite (peut contenir tool_use)
+                    for block2 in r2.content:
+                        if block2.type == "text":
+                            texte_reponse += block2.text
+                        elif block2.type == "tool_use" and block2.name == "ha_call_service":
+                            action_demandee = block2.input
+                        elif block2.type == "tool_use" and block2.name == "ha_create_automation":
+                            automation_demandee = block2.input
+                        elif block2.type == "tool_use" and block2.name == "ha_create_watch":
+                            watch_demandee = block2.input
+                except Exception as e:
+                    log.error(f"Search entities: {e}")
+                    texte_reponse = f"Erreur recherche: {e}"
+            elif block.type == "tool_use" and block.name == "ha_create_automation":
+                automation_demandee = block.input
             elif block.type == "tool_use" and block.name == "ha_create_watch":
                 watch_demandee = block.input
 
@@ -2230,13 +2345,140 @@ def appel_claude(message_utilisateur, contexte_ha=None):
                 log.error(f"❌ Watch creation: {e}")
                 return f"❌ Erreur création alerte : {str(e)[:100]}"
 
-        add_historique("assistant", texte_reponse)
+        # Automatisation HA — stocker en attente + boutons confirmation
+        if automation_demandee:
+            try:
+                alias = automation_demandee.get("alias", "AssistantIA Auto")
+                auto_data = {
+                    "alias": alias,
+                    "description": automation_demandee.get("description", "Créé par AssistantIA"),
+                    "trigger": automation_demandee.get("trigger", []),
+                    "condition": automation_demandee.get("condition", []),
+                    "action": automation_demandee.get("action", []),
+                    "mode": automation_demandee.get("mode", "single"),
+                }
+                # Annuler toute automatisation précédente en attente
+                mem_set("ha_automation_pending", "")
+                mem_set("ha_automation_pending", json.dumps(auto_data))
+
+                # Message résumé lisible + boutons
+                # Traduction triggers
+                TRAD_PLATFORM = {"numeric_state": "Quand la valeur de", "state": "Quand l'état de"}
+                TRAD_SERVICE = {
+                    "switch.turn_on": "Activer", "switch.turn_off": "Désactiver",
+                    "light.turn_on": "Allumer", "light.turn_off": "Éteindre",
+                    "cover.open_cover": "Ouvrir", "cover.close_cover": "Fermer",
+                    "climate.set_temperature": "Régler température",
+                    "number.set_value": "Régler la valeur de",
+                    "input_number.set_value": "Régler",
+                }
+
+                msg = f"📋 AUTOMATISATION PROPOSÉE\n━━━━━━━━━━━━━━━━━━\n"
+                msg += f"📝 {alias}\n\n"
+                msg += "📌 Déclencheurs :\n"
+                for t in auto_data.get("trigger", []):
+                    platform = t.get("platform", "")
+                    eid = t.get("entity_id", "")
+                    # Nom lisible
+                    eid_short = eid.split(".")[-1].replace("_", " ").title() if eid else ""
+                    above = t.get("above", "")
+                    below = t.get("below", "")
+                    to_state = t.get("to", "")
+                    trad = TRAD_PLATFORM.get(platform, platform)
+                    if above:
+                        msg += f"  • {trad} {eid_short} dépasse {above}\n"
+                    elif below:
+                        msg += f"  • {trad} {eid_short} descend sous {below}\n"
+                    elif to_state:
+                        msg += f"  • {trad} {eid_short} passe à {to_state}\n"
+                    else:
+                        msg += f"  • {trad} {eid_short} change\n"
+
+                def _format_action(a):
+                    """Formate une action HA en texte lisible."""
+                    lines = []
+                    # Action simple
+                    if "service" in a:
+                        svc = a["service"]
+                        target = a.get("target", {})
+                        eid_a = target.get("entity_id", a.get("entity_id", "")) if isinstance(target, dict) else str(target)
+                        eid_short = eid_a.split(".")[-1].replace("_", " ").title() if eid_a else ""
+                        svc_trad = TRAD_SERVICE.get(svc, svc.split(".")[-1].replace("_", " ").title() if svc else "Action")
+                        lines.append(f"  • {svc_trad} {eid_short}")
+                    # Choose (conditions multiples)
+                    elif "choose" in a:
+                        for choix in a["choose"]:
+                            conds = choix.get("conditions", [])
+                            cond_txt = ""
+                            for c in conds:
+                                if c.get("id"):
+                                    cond_txt = c["id"].replace("_", " ")
+                            for seq in choix.get("sequence", []):
+                                svc = seq.get("service", "")
+                                target = seq.get("target", {})
+                                eid_a = target.get("entity_id", "") if isinstance(target, dict) else ""
+                                eid_short = eid_a.split(".")[-1].replace("_", " ").title() if eid_a else ""
+                                svc_trad = TRAD_SERVICE.get(svc, svc.split(".")[-1].replace("_", " ").title() if svc else "Action")
+                                if cond_txt:
+                                    lines.append(f"  • Si {cond_txt} → {svc_trad} {eid_short}")
+                                else:
+                                    lines.append(f"  • {svc_trad} {eid_short}")
+                    # Delay, wait, etc.
+                    elif "delay" in a:
+                        lines.append(f"  • Attendre {a['delay']}")
+                    else:
+                        lines.append(f"  • Action personnalisée")
+                    return lines
+
+                msg += "\n⚡ Actions :\n"
+                for a in auto_data.get("action", []):
+                    for line in _format_action(a):
+                        msg += line + "\n"
+
+                if not auto_data.get("action"):
+                    msg += "  • (aucune action définie)\n"
+
+                telegram_send_buttons(msg, [
+                    {"text": "✅ Valider", "callback_data": "auto_confirm"},
+                    {"text": "✏️ Modifier", "callback_data": "auto_modify"},
+                    {"text": "❌ Annuler", "callback_data": "auto_cancel"},
+                ])
+                add_historique("assistant", msg)
+                return ""
+            except Exception as e:
+                log.error(f"Automation pending: {e}")
+
+                add_historique("assistant", texte_reponse)
         return texte_reponse
     except anthropic.AuthenticationError:
         return "❌ Clé API Anthropic invalide"
+    except anthropic.BadRequestError as e:
+        # Erreur de schéma tools → retry sans tools
+        log.warning(f"⚠️ Claude BadRequest (retry sans tools): {str(e)[:100]}")
+        try:
+            r2 = client.messages.create(
+                model=_model,
+                max_tokens=2000 if _use_sonnet else 1000,
+                system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+                messages=messages
+            )
+            log_token_usage(r2.usage.input_tokens, r2.usage.output_tokens)
+            texte_retry = "".join(b.text for b in r2.content if b.type == "text")
+            add_historique("user", message_utilisateur)
+            add_historique("assistant", texte_retry)
+            return texte_retry
+        except Exception as e2:
+            log.error(f"❌ Claude retry failed: {e2}")
+            return "Je n'ai pas pu traiter cette demande. Réessayez en reformulant."
+    except anthropic.RateLimitError:
+        log.warning("⏳ Rate limit API — réessayez dans 30 secondes.")
+        return "⏳ L'API est surchargée. Réessayez dans 30 secondes."
+    except anthropic.APIError as e:
+        log.error(f"❌ Claude API: {e}")
+        return "⚠️ Erreur temporaire. Réessayez."
     except Exception as e:
         log.error(f"❌ Claude: {e}")
-        return f"❌ Erreur Claude: {str(e)[:100]}"
+        return "Je n'ai pas pu traiter cette demande. Réessayez."
 
 def transcrire_vocal(file_id):
     """Transcrit un message vocal Telegram via Google Speech API. CRASH-PROOF."""

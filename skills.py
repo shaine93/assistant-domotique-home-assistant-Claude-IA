@@ -1389,6 +1389,49 @@ def traiter_callback(callback_query):
             telegram_send("🔐 Canal verrouillé — entrez le code SMS d'abord.")
             return
 
+    # ═══ AUTOMATISATIONS HA — Confirmation / Annulation ═══
+    if data == "auto_confirm":
+        pending = mem_get("ha_automation_pending")
+        if not pending:
+            telegram_send("⚠️ Aucune automatisation en attente (déjà validée ou annulée).")
+            return
+        try:
+            auto_data = json.loads(pending)
+            alias = auto_data.get("alias", "AssistantIA Auto")
+            auto_id = alias.lower().replace(" ", "_").replace("-", "_").replace("é", "e").replace("è", "e").replace("à", "a")[:40]
+
+            # Vérifier si elle existe déjà
+            existing = ha_get(f"states/automation.{auto_id}")
+            if existing and existing.get("state") in ("on", "off"):
+                telegram_send(f"⚠️ L'automatisation '{alias}' existe déjà. Supprimez-la d'abord dans HA ou demandez une modification.")
+                mem_set("ha_automation_pending", "")
+                return
+
+            result = ha_post(f"config/automation/config/{auto_id}", auto_data)
+            mem_set("ha_automation_pending", "")
+            if result is not None:
+                telegram_send(f"✅ Automatisation créée : {alias}")
+            else:
+                telegram_send("❌ Erreur création automatisation HA")
+        except Exception as e:
+            telegram_send(f"❌ Erreur: {e}")
+            log.error(f"Auto confirm: {e}")
+        return
+
+    if data == "auto_modify":
+        pending = mem_get("ha_automation_pending")
+        if pending:
+            mem_set("ha_automation_modify", "oui")
+            telegram_send("✏️ Décrivez les modifications souhaitées.\nExemple : \"Change le seuil à 90% au lieu de 100%\"")
+        else:
+            telegram_send("⚠️ Aucune automatisation en attente.")
+        return
+
+    if data == "auto_cancel":
+        mem_set("ha_automation_pending", "")
+        telegram_send("❌ Automatisation annulée.")
+        return
+
     # ═══ ACTIONS HA — Confirmation / Annulation ═══
     if data == "ha_action:confirm":
         pending = mem_get("ha_action_pending")
@@ -11306,6 +11349,23 @@ def bilan_automatique():
         if mem_get("mode_vacances") == "actif":
             mem_set("mode_vacances", "")
             telegram_send("🏠 Mode vacances désactivé — bon retour !")
+    except Exception:
+        pass
+
+    # Modification automatisation en attente
+    try:
+        if mem_get("ha_automation_modify") == "oui":
+            pending = mem_get("ha_automation_pending")
+            if pending:
+                mem_set("ha_automation_modify", "")
+                # Envoyer la modification + l'automatisation en cours à Claude Sonnet
+                contexte = ha_get_contexte_intelligent()
+                msg_modif = (
+                    f"Voici l'automatisation en cours de modification :\n{pending}\n\n"
+                    f"Modification demandée : {texte}\n\n"
+                    f"Applique la modification et renvoie l'automatisation corrigée avec ha_create_automation."
+                )
+                return appel_claude(msg_modif, contexte)
     except Exception:
         pass
     telegram_send("📊 Génération du bilan automatique en cours...")

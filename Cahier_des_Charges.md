@@ -815,6 +815,29 @@ assistant.py   →    920 lignes   main(), threads, wizard, voice handler, pycac
 - **Commandes** : appareils, machines
 - **Fix /pieces** : filtre énergie solaire (APSystems exclu)
 
+
+### v1.5.5 (11 avril 2026)
+- **Intégration Google Home / Alexa** : scripts HA créés via API, TTS Nest Hub (chambre + salon)
+- **API vocale /ask** : endpoint sur deploy server, réponse en 2s
+- **ha_search_entities** : outil générique — Claude cherche les entités sur TOUTE installation HA
+- **ha_create_automation** : Claude Sonnet crée des automatisations HA complètes (triggers, conditions, actions choose)
+- **Confirmation 3 boutons** : Valider / Modifier / Annuler avec résumé en français
+- **Protection anti-doublon** : impossible de créer 2x la même automatisation
+- **Smart model** : Sonnet pour les automatisations complexes, Haiku pour le reste
+- **Error handling** : retry sans tools sur BadRequest, jamais d'erreur brute à l'utilisateur
+- **Mode DEV** : canal ouvert sans SMS
+- **Prompt autonome** : Claude ne pose plus de questions, il cherche et agit
+- **Commandes** : 62 commandes Telegram + vocal + Google Home
+
+### Architecture API vocale
+```
+Google Home → "Hey Google, exécute AssistantIA énergie"
+    → HA script.assistantia_energie (créé via API)
+    → AssistantIA détecte le trigger
+    → traiter_message("énergie")
+    → TTS google_translate_say sur media_player.salon + chambre
+```
+
 ### GitHub
 - Repo public : https://github.com/shaine93/assistant-domotique-home-assistant-Claude-IA
 - 27 fichiers, sanitisés, MIT license
@@ -955,7 +978,7 @@ Flux : testeur trouve un bug → issue GitHub → fix Opus → push → **auto-u
 #### 🚀 Priorité 4 — Vision produit (v3.0+)
 
 - [x] **Suivi consommation par pièce** : si les areas HA sont configurées, regrouper la conso par pièce. "La chambre consomme 2x plus que d'habitude"
-- [ ] **Intégration vocale** : Google Home / Alexa via HA. "Hey Google, demande à l'assistant combien j'ai économisé ce mois"
+- [x] **Intégration vocale** : Google Home / Alexa via HA. "Hey Google, demande à l'assistant combien j'ai économisé ce mois"
 - [x] **Détection fuite d'eau** : si capteur d'eau HA présent, surveiller et alerter immédiatement (SMS + Telegram)
 - [x] **Alerte Zigbee device mort** : si un device a un LQI tombé à 0 depuis > 24h ou "unavailable" persistant → notification + suggestion (changer pile, rapprocher du routeur)
 - [x] **Apprentissage tarif Tempo/EJP** : si contrat Tempo, notifier la veille "Demain jour ROUGE — décalez vos machines". Intégration API RTE
