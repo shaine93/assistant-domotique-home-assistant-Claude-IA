@@ -838,6 +838,27 @@ Google Home → "Hey Google, exécute AssistantIA énergie"
     → TTS google_translate_say sur media_player.salon + chambre
 ```
 
+
+### Routines Google Home / Alexa — Guide complet
+
+Les 10 scripts HA sont créés automatiquement par le script au démarrage.
+Pour les activer : app Google Home → Automatisations → Ajouter → Déclencheur vocal → Action "Ajuster des appareils" → script correspondant.
+
+| Phrase vocale | Script HA | Réponse |
+|---|---|---|
+| "Hey Google, énergie maison" | `script.assistantia_energie` | Bilan complet : solaire, conso, machines |
+| "Hey Google, score maison" | `script.assistantia_score` | Note DPE dynamique A-D sur 100 |
+| "Hey Google, état maison" | `script.assistantia_debug` | Vérification système |
+| "Hey Google, conso par pièce" | `script.assistantia_pieces` | Répartition watts par pièce |
+| "Hey Google, conseil contrat" | `script.assistantia_contrat` | Comparaison fournisseurs |
+| "Hey Google, machines connues" | `script.assistantia_machines` | Appareils détectés |
+| "Hey Google, retour investissement" | `script.assistantia_roi` | ROI économies vs coût API |
+| "Hey Google, mes alertes" | `script.assistantia_alertes` | Alertes actives (watches) |
+| "Hey Google, production solaire" | `script.assistantia_solaire` | Production solaire en cours |
+| "Hey Google, facture EDF" | `script.assistantia_facture` | Projection fin de mois |
+
+La réponse est parlée via TTS sur tous les media_players configurés dans `config.json` → `tts_media_players`.
+
 ### GitHub
 - Repo public : https://github.com/shaine93/assistant-domotique-home-assistant-Claude-IA
 - 27 fichiers, sanitisés, MIT license

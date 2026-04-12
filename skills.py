@@ -11055,6 +11055,11 @@ def _check_vocal_scripts(index, now):
             "script.assistantia_debug": "debug",
             "script.assistantia_pieces": "pieces",
             "script.assistantia_contrat": "contrat",
+            "script.assistantia_machines": "appareils",
+            "script.assistantia_roi": "roi",
+            "script.assistantia_alertes": "watches",
+            "script.assistantia_solaire": "solaire",
+            "script.assistantia_facture": "facture",
         }
 
         found = 0
