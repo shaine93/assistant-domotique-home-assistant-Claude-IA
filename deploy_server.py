@@ -26,6 +26,55 @@ VERSIONS_DIR = "/home/lolufe/assistant/versions"
 DEPLOY_LOG = "/home/lolufe/assistant/deploy.log"
 PORT = 8501
 
+# ═══ INFRA ═══
+TUNNEL_URL_FILE = "/home/lolufe/assistant/tunnel_url.txt"
+NTFY_TOPIC = "assistantia-deploy-8501-secret"
+HEARTBEAT_INTERVAL = 3600  # 1h — garde l'URL fraîche dans la fenêtre 24h de ntfy
+
+# Unit files systemd (écrits par /infra_install)
+DEPLOY_SERVER_UNIT = """[Unit]
+Description=AssistantIA Deploy Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lolufe
+WorkingDirectory=/home/lolufe/assistant
+ExecStart=/usr/bin/python3 /home/lolufe/assistant/deploy_server.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/home/lolufe/assistant/deploy_server.log
+StandardError=append:/home/lolufe/assistant/deploy_server.log
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+CLOUDFLARED_TUNNEL_UNIT = """[Unit]
+Description=Cloudflare Tunnel for AssistantIA Deploy Server
+After=network-online.target deploy_server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lolufe
+WorkingDirectory=/home/lolufe/assistant
+ExecStart=/bin/bash /home/lolufe/assistant/tunnel_wrapper.sh
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/lolufe/assistant/tunnel.log
+StandardError=append:/home/lolufe/assistant/tunnel.log
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
 ALLOWED_EXTENSIONS = {".py", ".md", ".txt", ".json", ".yaml", ".yml", ".sh", ".cfg", ".ini", ".log"}
 FORBIDDEN_PATHS = {"config.json"}
 
@@ -246,6 +295,164 @@ def action_patch(data):
             return {"status": "error", "message": f"Rollback: {e}"}
     return {"status": "error", "message": f"Mode inconnu: {mode}"}
 
+def action_probe_sudo():
+    """Test non-destructif des droits sudo requis pour le bootstrap infra."""
+    tests = [(["sudo", "-n", "-l"], "sudo_-l")]
+    results = {}
+    for cmd, label in tests:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            results[label] = {"rc": r.returncode,
+                              "stdout": (r.stdout or "").strip()[:4000],
+                              "stderr": (r.stderr or "").strip()[:500]}
+        except Exception as e:
+            results[label] = {"error": str(e)[:200]}
+    # Nettoyage
+    try: subprocess.run(["sudo", "-n", "rm", "-f", "/tmp/__sudo_cp_probe"],
+                        capture_output=True, timeout=5)
+    except: pass
+    ok = all(r.get("rc") == 0 for r in results.values())
+    return {"status": "ok" if ok else "partial", "can_bootstrap": ok, "tests": results}
+
+
+def action_infra_install():
+    """Installe les unit files systemd + daemon-reload + enable.
+    N'effectue PAS de start/restart — handoff séparé."""
+    try:
+        # Écriture dans /tmp (propriétaire = lolufe, pas de sudo)
+        with open("/tmp/deploy_server.service", "w") as f:
+            f.write(DEPLOY_SERVER_UNIT)
+        with open("/tmp/cloudflared_tunnel.service", "w") as f:
+            f.write(CLOUDFLARED_TUNNEL_UNIT)
+
+        steps = []
+        for unit in ["deploy_server.service", "cloudflared_tunnel.service"]:
+            r = subprocess.run(
+                ["sudo", "-n", "cp", f"/tmp/{unit}", f"/etc/systemd/system/{unit}"],
+                capture_output=True, text=True, timeout=10)
+            steps.append((f"cp {unit}", r.returncode, (r.stderr or "").strip()[:200]))
+            if r.returncode != 0:
+                return {"status": "error", "steps": steps}
+
+        r = subprocess.run(["sudo", "-n", "systemctl", "daemon-reload"],
+                           capture_output=True, text=True, timeout=10)
+        steps.append(("daemon-reload", r.returncode, (r.stderr or "").strip()[:200]))
+        if r.returncode != 0:
+            return {"status": "error", "steps": steps}
+
+        for svc in ["deploy_server.service", "cloudflared_tunnel.service"]:
+            r = subprocess.run(["sudo", "-n", "systemctl", "enable", svc],
+                               capture_output=True, text=True, timeout=10)
+            steps.append((f"enable {svc}", r.returncode,
+                          (r.stderr or r.stdout or "").strip()[:200]))
+
+        log_deploy("✅ Systemd units installés + activés au boot")
+        return {"status": "ok", "steps": steps,
+                "installed": ["deploy_server.service", "cloudflared_tunnel.service"]}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+def action_infra_status():
+    """État de tous les services + URL tunnel courante."""
+    services = ["deploy_server.service", "cloudflared_tunnel.service", "assistant.service"]
+    result = {}
+    for svc in services:
+        try:
+            a = subprocess.run(["systemctl", "is-active", svc],
+                               capture_output=True, text=True, timeout=5)
+            e = subprocess.run(["systemctl", "is-enabled", svc],
+                               capture_output=True, text=True, timeout=5)
+            p = subprocess.run(["systemctl", "show", svc, "--property=MainPID,ExecMainStartTimestamp"],
+                               capture_output=True, text=True, timeout=5)
+            result[svc] = {
+                "active": a.stdout.strip() or a.stderr.strip()[:60],
+                "enabled": e.stdout.strip() or e.stderr.strip()[:60],
+                "info": p.stdout.strip().replace("\n", " | ")[:200]
+            }
+        except Exception as ex:
+            result[svc] = {"error": str(ex)[:200]}
+
+    tunnel_url = None
+    try:
+        with open(TUNNEL_URL_FILE) as f:
+            tunnel_url = f.read().strip()
+    except Exception:
+        pass
+
+    # Est-ce que JE tourne sous systemd ?
+    my_pid = os.getpid()
+    ps = subprocess.run(["ps", "-o", "ppid,cmd", "-p", str(my_pid)],
+                        capture_output=True, text=True, timeout=5)
+    ppid_line = ps.stdout.strip().split("\n")[-1] if ps.stdout else ""
+    under_systemd = False
+    try:
+        ppid = int(ppid_line.strip().split()[0])
+        # Si PPID == 1 (init/systemd), c'est systemd qui nous gère
+        under_systemd = (ppid == 1)
+    except Exception:
+        pass
+
+    return {"status": "ok", "services": result, "tunnel_url": tunnel_url,
+            "my_pid": my_pid, "my_ppid_line": ppid_line,
+            "under_systemd": under_systemd,
+            "timestamp": datetime.now().isoformat()}
+
+
+def action_infra_handoff():
+    """Tue le process actuel (nohup) et laisse systemd démarrer une instance fraîche.
+    Script lancé en arrière-plan détaché → réponse envoyée avant la mort du process."""
+    my_pid = os.getpid()
+    script = f"""#!/bin/bash
+set -u
+sleep 3
+# Étape 1: démarrer le service systemd (échouera à bind le port tant qu'on vit,
+# mais Restart=always retentera après notre mort)
+sudo -n systemctl start deploy_server.service 2>&1 | logger -t infra_handoff
+# Étape 2: tuer le process courant (nohup orphan)
+sudo -n kill -TERM {my_pid} 2>&1 | logger -t infra_handoff
+sleep 2
+# Étape 3: s'assurer que systemd a bien rebind
+sudo -n systemctl restart deploy_server.service 2>&1 | logger -t infra_handoff
+# Étape 4: handoff tunnel aussi
+sleep 1
+# Tuer les éventuels orphans cloudflared + tunnel_wrapper
+pkill -TERM -f "tunnel_wrapper.sh" 2>&1 | logger -t infra_handoff || true
+pkill -TERM -f "cloudflared tunnel --url http://localhost:8501" 2>&1 | logger -t infra_handoff || true
+sleep 2
+sudo -n systemctl restart cloudflared_tunnel.service 2>&1 | logger -t infra_handoff
+"""
+    script_path = "/tmp/infra_handoff.sh"
+    with open(script_path, "w") as f:
+        f.write(script)
+    os.chmod(script_path, 0o755)
+    # Fork-and-forget, détaché de notre session
+    subprocess.Popen(["bash", script_path], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    log_deploy(f"🔄 Handoff systemd programmé dans 3s (pid {my_pid} sera tué)")
+    return {"status": "ok", "message": "Handoff systemd en cours (~10s)",
+            "pid_to_kill": my_pid,
+            "expected_new_tunnel_url": "publiée sur ntfy.sh après ~5s"}
+
+
+def _heartbeat_loop():
+    """Toutes les HEARTBEAT_INTERVAL secondes, republie l'URL tunnel sur ntfy.sh.
+    Garde l'URL fraîche dans la fenêtre 24h de ntfy, même si le tunnel n'a pas redémarré."""
+    while True:
+        try:
+            time.sleep(HEARTBEAT_INTERVAL)
+            if os.path.exists(TUNNEL_URL_FILE):
+                with open(TUNNEL_URL_FILE) as f:
+                    url = f.read().strip()
+                if url.startswith("https://"):
+                    subprocess.run(
+                        ["curl", "-s", "-m", "10", "-d", url, f"https://ntfy.sh/{NTFY_TOPIC}"],
+                        capture_output=True, timeout=15)
+                    log_deploy(f"💓 heartbeat: {url}")
+        except Exception as e:
+            log_deploy(f"❌ heartbeat: {e}")
+
+
 def action_restart_self():
     """Re-exec le deploy_server lui-même (bootstrap d'une nouvelle version).
     Réponse envoyée d'abord, puis exec dans un thread après 1s."""
@@ -361,6 +568,10 @@ class DeployHandler(BaseHTTPRequestHandler):
             self._respond(200, action_logs(n))
         elif self.path == "/ping":
             self._respond(200, {"status": "ok", "message": "deploy_server v2 alive"})
+        elif self.path == "/infra_status":
+            self._respond(200, action_infra_status())
+        elif self.path == "/sudo_probe":
+            self._respond(200, action_probe_sudo())
         elif self.path.startswith("/ls"):
             subdir = self.path[4:] if len(self.path) > 4 else ""
             self._respond(200, action_list_files(subdir))
@@ -384,6 +595,10 @@ class DeployHandler(BaseHTTPRequestHandler):
             self._respond(200, action_restart())
         elif self.path == "/restart_self":
             self._respond(200, action_restart_self())
+        elif self.path == "/infra_install":
+            self._respond(200, action_infra_install())
+        elif self.path == "/infra_handoff":
+            self._respond(200, action_infra_handoff())
         elif self.path == "/rollback":
             self._respond(200, action_rollback())
         elif self.path == "/file":
@@ -413,6 +628,8 @@ class DeployHandler(BaseHTTPRequestHandler):
 def main():
     os.makedirs(VERSIONS_DIR, exist_ok=True)
     log_deploy(f"🚀 Deploy Server v2 démarré sur port {PORT}")
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
+    log_deploy(f"💓 Heartbeat ntfy.sh activé (chaque {HEARTBEAT_INTERVAL}s)")
     server = ThreadingHTTPServer(("0.0.0.0", PORT), DeployHandler)
     try:
         server.serve_forever()
