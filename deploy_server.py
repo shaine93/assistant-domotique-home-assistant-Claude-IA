@@ -11,9 +11,13 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import threading
 import time
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+_LOG_LOCK = threading.Lock()
 
 CONFIG_PATH = "/home/lolufe/assistant/config.json"
 SCRIPT_PATH = "/home/lolufe/assistant/assistant.py"
@@ -36,14 +40,15 @@ def log_deploy(message):
     line = f"[{timestamp}] {message}"
     print(line)
     try:
-        with open(DEPLOY_LOG, "a") as f:
-            f.write(line + "\n")
-        # Rotation si trop gros
-        if os.path.getsize(DEPLOY_LOG) > MAX_DEPLOY_LOG_KB * 1024:
-            with open(DEPLOY_LOG, "r") as f:
-                lines = f.readlines()
-            with open(DEPLOY_LOG, "w") as f:
-                f.writelines(lines[-1000:])  # Garder les 1000 dernières lignes
+        with _LOG_LOCK:
+            with open(DEPLOY_LOG, "a") as f:
+                f.write(line + "\n")
+            # Rotation si trop gros
+            if os.path.getsize(DEPLOY_LOG) > MAX_DEPLOY_LOG_KB * 1024:
+                with open(DEPLOY_LOG, "r") as f:
+                    lines = f.readlines()
+                with open(DEPLOY_LOG, "w") as f:
+                    f.writelines(lines[-1000:])  # Garder les 1000 dernières lignes
     except Exception:
         pass
 
@@ -241,6 +246,21 @@ def action_patch(data):
             return {"status": "error", "message": f"Rollback: {e}"}
     return {"status": "error", "message": f"Mode inconnu: {mode}"}
 
+def action_restart_self():
+    """Re-exec le deploy_server lui-même (bootstrap d'une nouvelle version).
+    Réponse envoyée d'abord, puis exec dans un thread après 1s."""
+    def _delayed_exec():
+        time.sleep(1)
+        log_deploy("🔄 Deploy Server self-restart (os.execv)")
+        try:
+            os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
+        except Exception as e:
+            log_deploy(f"❌ execv échoué: {e}")
+            os._exit(1)
+    threading.Thread(target=_delayed_exec, daemon=False).start()
+    return {"status": "ok", "message": "Redémarrage deploy_server dans ~1s",
+            "timestamp": datetime.now().isoformat()}
+
 def action_restart():
     try:
         subprocess.run(["sudo", "systemctl", "restart", "assistant"], capture_output=True, text=True, timeout=30)
@@ -362,6 +382,8 @@ class DeployHandler(BaseHTTPRequestHandler):
             self._respond(200, action_patch(data))
         elif self.path == "/restart":
             self._respond(200, action_restart())
+        elif self.path == "/restart_self":
+            self._respond(200, action_restart_self())
         elif self.path == "/rollback":
             self._respond(200, action_rollback())
         elif self.path == "/file":
@@ -391,7 +413,7 @@ class DeployHandler(BaseHTTPRequestHandler):
 def main():
     os.makedirs(VERSIONS_DIR, exist_ok=True)
     log_deploy(f"🚀 Deploy Server v2 démarré sur port {PORT}")
-    server = HTTPServer(("0.0.0.0", PORT), DeployHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), DeployHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

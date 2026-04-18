@@ -1,0 +1,10 @@
+version: "3"
+services:
+  assistantia:
+    image: ghcr.io/votre-repo/assistantia-domotique:latest
+    container_name: assistantia
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8501:8501"

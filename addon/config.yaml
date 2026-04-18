@@ -1,0 +1,35 @@
+name: AssistantIA Domotique
+version: 7.23
+slug: assistantia
+description: "L'antivirus de votre maison — Agent IA autonome qui surveille, apprend et optimise votre énergie via Home Assistant + Claude AI"
+url: https://github.com/votre-repo/assistantia-domotique
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+homeassistant_api: true
+hassio_api: true
+ingress: false
+panel_icon: mdi:robot
+panel_title: AssistantIA
+ports:
+  8501/tcp: 8501
+ports_description:
+  8501/tcp: Deploy Server (patches à distance)
+options:
+  telegram_token: ""
+  anthropic_api_key: ""
+  sms_method: "email"
+  anthropic_monthly_budget_usd: 10
+schema:
+  telegram_token: str
+  anthropic_api_key: str
+  sms_method: list(free_mobile|ha_notify|email)
+  anthropic_monthly_budget_usd: int
+map:
+  - config:rw
+  - ssl:ro
+startup: application
+boot: auto
