@@ -1,9 +1,77 @@
 # 📋 CAHIER DES CHARGES — AssistantIA Domotique v7.60
 ## L'IA qui gère votre maison. Vous ne faites rien.
 
-**Version** : 7.61
-**Date** : 18/04/2026
+**Version** : 7.62
+**Date** : 19/04/2026
 **Script** : 4 fichiers | 22 tables | 11 threads | 18 skills | 51 commandes | 25 rôles
+
+---
+
+## 🛡️ INFRASTRUCTURE AUTONOME — Garantie d'accès permanent (19/04/2026)
+
+### Architecture systemd
+
+L'accès Claude → VM est garanti 24/7 par 4 services systemd :
+
+| Service                       | Rôle                                          | Restart            |
+|-------------------------------|-----------------------------------------------|--------------------|
+| `assistant.service`           | Le bot AssistantIA (assistant.py)             | always, RestartSec=10 |
+| `deploy_server.service`       | API REST pour Claude (port 8501)              | always, RestartSec=3  |
+| `cloudflared_tunnel.service`  | Tunnel Cloudflare → expose deploy_server      | always, RestartSec=5  |
+| `infra_watchdog.timer`        | Health-check toutes les 2 min, restart si KO  | timer systemd         |
+
+Tous les services sont `enabled` → redémarrage automatique au boot de la VM.
+
+### Sudoers minimal
+
+`/etc/sudoers.d/lolufe-infra` autorise sans mot de passe :
+- `systemctl` (toutes commandes)
+- `cp /tmp/*.service|*.timer /etc/systemd/system/*.service|*.timer`
+- `rm /etc/systemd/system/*.service|*.timer`
+
+Toutes les autres commandes sudo restent protégées par mot de passe.
+
+### Endpoints d'admin (deploy_server)
+
+| Endpoint              | Méthode | Effet                                        |
+|-----------------------|---------|----------------------------------------------|
+| `/restart_self`       | POST    | Re-exec deploy_server (pour activer un patch) |
+| `/infra_install`      | POST    | (Ré-)installe les 4 unit files systemd       |
+| `/infra_status`       | GET     | État des services + URL tunnel               |
+| `/infra_handoff`      | POST    | Migration nohup → systemd (ne sert qu'1 fois) |
+| `/sudo_probe`         | GET     | Vérifie les droits sudo                      |
+| `/diag_processes`     | GET     | Inventaire des processes                     |
+| `/journalctl/<svc>`   | GET     | Lit le journal systemd d'un service          |
+
+### Watchdog
+
+Le script `/home/lolufe/assistant/watchdog.sh` (toutes les 2 min) :
+1. Teste `curl http://127.0.0.1:8501/ping` → si KO : restart deploy_server
+2. Vérifie présence de `tunnel_url.txt` → si vide : restart tunnel
+3. Teste l'URL externe via curl → si HTTP != 200/401 : restart tunnel
+
+Logs dans `/home/lolufe/assistant/watchdog.log` (rotation auto à 200KB).
+
+### Heartbeat ntfy.sh
+
+Le deploy_server republie l'URL tunnel actuelle sur ntfy.sh toutes les heures
+(topic `assistantia-deploy-8501-secret`) → l'URL reste fraîche dans la fenêtre 24h
+même si le tunnel n'a pas redémarré.
+
+### Validation
+
+- 140/140 requêtes OK en stress test (100% — était ~66% avant le passage en ThreadingHTTPServer)
+- Test crash-recovery : `pkill -9 tunnel_wrapper.sh` → nouvelle URL publiée 10s plus tard
+- Test reboot : services `enabled` → redémarrage auto au boot
+
+### Pièges connus (résolus)
+
+- `HTTPServer` stdlib = single-thread → 503 sous charge parallèle. Fix : `ThreadingHTTPServer`
+- `tunnel_wrapper.sh` écrivait dans `tunnel.log` que systemd avait déjà ouvert → permission denied → wrapper plantait → systemd Restart → boucle. Fix : wrapper ne touche plus tunnel.log, systemd s'en charge via `StandardOutput=`
+- Doublon `cloudflared.service` (ancien) + `cloudflared_tunnel.service` (nouveau) lançaient le même wrapper → 2 tunnels concurrents. Fix : `cloudflared.service` supprimé
+- `StartLimitIntervalSec` doit être dans `[Unit]`, pas `[Service]` (systemd ≥ 230)
+- `KillMode=control-group` (pas `mixed`) → garantit que `systemctl stop` tue toute la cgroup
+- `wait $PID` après `cmd &` dans le wrapper, pas `cmd | while read` → un seul niveau de fork
 
 ---
 

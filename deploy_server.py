@@ -36,27 +36,54 @@ DEPLOY_SERVER_UNIT = """[Unit]
 Description=AssistantIA Deploy Server
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 User=lolufe
 WorkingDirectory=/home/lolufe/assistant
-ExecStart=/usr/bin/python3 /home/lolufe/assistant/deploy_server.py
+ExecStart=/usr/bin/python3 -u /home/lolufe/assistant/deploy_server.py
 Restart=always
 RestartSec=3
 StandardOutput=append:/home/lolufe/assistant/deploy_server.log
 StandardError=append:/home/lolufe/assistant/deploy_server.log
-KillMode=mixed
+KillMode=control-group
 TimeoutStopSec=10
 
 [Install]
 WantedBy=multi-user.target
 """
 
+WATCHDOG_SERVICE_UNIT = """[Unit]
+Description=AssistantIA Infra Watchdog (one-shot health check)
+
+[Service]
+Type=oneshot
+User=lolufe
+WorkingDirectory=/home/lolufe/assistant
+ExecStart=/bin/bash /home/lolufe/assistant/watchdog.sh
+StandardOutput=append:/home/lolufe/assistant/watchdog.log
+StandardError=append:/home/lolufe/assistant/watchdog.log
+"""
+
+WATCHDOG_TIMER_UNIT = """[Unit]
+Description=AssistantIA Infra Watchdog timer (toutes les 2 min)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+Unit=infra_watchdog.service
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+"""
+
 CLOUDFLARED_TUNNEL_UNIT = """[Unit]
 Description=Cloudflare Tunnel for AssistantIA Deploy Server
 After=network-online.target deploy_server.service
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -67,8 +94,8 @@ Restart=always
 RestartSec=5
 StandardOutput=append:/home/lolufe/assistant/tunnel.log
 StandardError=append:/home/lolufe/assistant/tunnel.log
-KillMode=mixed
-TimeoutStopSec=10
+KillMode=control-group
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target
@@ -295,9 +322,506 @@ def action_patch(data):
             return {"status": "error", "message": f"Rollback: {e}"}
     return {"status": "error", "message": f"Mode inconnu: {mode}"}
 
+def action_test_kill_wrapper():
+    """TEST : tue le wrapper actuel pour valider le redémarrage auto par systemd."""
+    try:
+        r = subprocess.run(["pkill", "-9", "-f", "tunnel_wrapper.sh"],
+                           capture_output=True, text=True, timeout=5)
+        return {"status": "ok", "rc": r.returncode, "msg": "wrapper killed -9"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+def action_timer_status():
+    out = {}
+    for cmd, label in [
+        (["systemctl", "list-timers", "infra_watchdog.timer", "--no-pager"], "list-timers"),
+        (["systemctl", "status", "infra_watchdog.timer", "--no-pager"], "status_timer"),
+        (["systemctl", "status", "infra_watchdog.service", "--no-pager"], "status_service"),
+    ]:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            out[label] = r.stdout
+        except Exception as e:
+            out[label] = str(e)
+    return {"status": "ok", "info": out}
+
+def action_kill_zombies():
+    """Tue les vieux sudo systemctl status zombies hérités d'avant."""
+    out = []
+    try:
+        # Les 3 zombies actuels : 393808, 861341, 3916863 + leurs enfants
+        # On cible les vieux 'sudo systemctl status' qui ont pas terminé
+        r = subprocess.run(["bash", "-c",
+            "ps -eo pid,etime,cmd | grep -E 'sudo systemctl status|systemctl status [a-z]+$' "
+            "| grep -v grep "
+            "| awk '$2 ~ /-|h/ || $2 ~ /^[0-9]+:/ {print $1}' "
+            "| head -20"],
+            capture_output=True, text=True, timeout=5)
+        zombies = [int(p) for p in r.stdout.split() if p.strip().isdigit()]
+        out.append(f"Zombies trouvés: {zombies}")
+        for pid in zombies:
+            try:
+                # On peut pas kill un sudo sans sudo, mais on essaie d'abord soft
+                r2 = subprocess.run(["kill", "-TERM", str(pid)],
+                                    capture_output=True, text=True, timeout=3)
+                if r2.returncode == 0:
+                    out.append(f"  kill TERM {pid}: OK")
+                else:
+                    # Essayer avec sudo (autorisé pour systemctl mais pas kill...)
+                    out.append(f"  kill TERM {pid}: échec ({r2.stderr.strip()[:80]})")
+            except Exception as e:
+                out.append(f"  kill {pid}: {e}")
+        # Vérifier
+        import time
+        time.sleep(2)
+        r3 = subprocess.run(["bash", "-c", "ps -eo pid,etime,cmd | grep -E 'sudo systemctl status' | grep -v grep"],
+                            capture_output=True, text=True, timeout=5)
+        out.append(f"Restants: {r3.stdout.strip() or '(rien)'}")
+    except Exception as e:
+        out.append(f"ERR: {e}")
+    return {"status": "ok", "log": out}
+
+def action_eliminate_duplicate():
+    """Élimine le service cloudflared.service (doublon).
+    Détaché pour survivre à la coupure éventuelle du tunnel pendant l'opération."""
+    script = """#!/bin/bash
+set -u
+exec >> /home/lolufe/assistant/handoff.log 2>&1
+echo ""
+echo "════════ ELIMINATE_DUPLICATE $(date -Iseconds) ════════"
+
+# 1. Snapshot AVANT
+echo "[T0] Services tunnel actifs :"
+systemctl is-active cloudflared.service && echo "  cloudflared.service: ACTIVE" || echo "  cloudflared.service: inactive"
+systemctl is-active cloudflared_tunnel.service && echo "  cloudflared_tunnel.service: ACTIVE" || echo "  cloudflared_tunnel.service: inactive"
+echo "[T0] Wrappers en cours :"
+pgrep -af tunnel_wrapper.sh || echo "  (aucun)"
+echo "─────"
+sleep 1
+
+# 2. Stop + disable + remove du DOUBLON
+echo "[T1] Stop cloudflared.service (le doublon)"
+sudo -n systemctl stop cloudflared.service || true
+sleep 1
+
+echo "[T2] Disable cloudflared.service"
+sudo -n systemctl disable cloudflared.service || true
+
+echo "[T3] Remove unit file"
+sudo -n rm /etc/systemd/system/cloudflared.service || true
+# Nettoyer aussi le symlink wants/ s'il existe
+sudo -n rm /etc/systemd/system/multi-user.target.wants/cloudflared.service 2>/dev/null || true
+
+echo "[T4] daemon-reload"
+sudo -n systemctl daemon-reload
+
+# 3. Tuer ce qui resterait orphan (au cas où)
+sleep 2
+pkill -TERM -f "tunnel_wrapper.sh" 2>/dev/null || true
+pkill -TERM -f "cloudflared tunnel --url http://localhost:8501" 2>/dev/null || true
+sleep 2
+pkill -KILL -f "tunnel_wrapper.sh" 2>/dev/null || true
+pkill -KILL -f "cloudflared tunnel --url http://localhost:8501" 2>/dev/null || true
+
+# 4. Settle 5s
+echo "[T5] Settle 5s..."
+sleep 5
+echo "[T5+5s] Wrappers restants :"
+pgrep -af tunnel_wrapper.sh || echo "  (aucun ✅)"
+
+# 5. Démarrer UN SEUL service (le mien)
+echo "[T6] systemctl start cloudflared_tunnel.service (le seul restant)"
+sudo -n systemctl restart cloudflared_tunnel.service
+
+# 6. Attendre 12s pour la connexion + URL publication
+sleep 12
+
+echo "[FINAL] :"
+echo "  Wrappers : $(pgrep -af tunnel_wrapper.sh | wc -l)"
+echo "  Cloudflared : $(pgrep -f 'cloudflared tunnel.*localhost' | wc -l)"
+pgrep -af tunnel_wrapper.sh || true
+pgrep -af "cloudflared tunnel" || true
+echo "  URL : $(cat /home/lolufe/assistant/tunnel_url.txt 2>/dev/null)"
+
+W=$(pgrep -f 'tunnel_wrapper.sh' | wc -l)
+C=$(pgrep -f 'cloudflared tunnel.*localhost' | wc -l)
+if [ "$W" = "1" ] && [ "$C" = "1" ]; then
+    echo "[OK] PROPRE : 1 wrapper + 1 cloudflared"
+else
+    echo "[FAIL] $W wrappers, $C cloudflared (devrait être 1+1)"
+fi
+echo "════════ FIN ELIMINATE_DUPLICATE ════════"
+"""
+    p = "/tmp/eliminate_duplicate.sh"
+    with open(p, "w") as f: f.write(script)
+    os.chmod(p, 0o755)
+    subprocess.Popen(["bash", p], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    log_deploy("🗑️ Élimination doublon cloudflared.service programmée (~30s)")
+    return {"status": "ok", "message": "Élimination en cours, attendre ~32s"}
+
+
+def action_inspect_old_cloudflared():
+    """Inspecte le service cloudflared.service (l'ancien) pour comprendre."""
+    out = {}
+    try:
+        r = subprocess.run(["cat", "/etc/systemd/system/cloudflared.service"],
+                           capture_output=True, text=True, timeout=5)
+        out["unit_content"] = r.stdout
+    except Exception as e: out["unit_content"] = f"ERR: {e}"
+    try:
+        r = subprocess.run(["systemctl", "is-active", "cloudflared.service"],
+                           capture_output=True, text=True, timeout=5)
+        out["is_active"] = r.stdout.strip()
+    except Exception as e: out["is_active"] = f"ERR: {e}"
+    try:
+        r = subprocess.run(["systemctl", "is-enabled", "cloudflared.service"],
+                           capture_output=True, text=True, timeout=5)
+        out["is_enabled"] = r.stdout.strip() + " | " + r.stderr.strip()
+    except Exception as e: out["is_enabled"] = f"ERR: {e}"
+    try:
+        r = subprocess.run(["journalctl", "-u", "cloudflared.service", "-n", "20", "--no-pager", "-o", "short-iso"],
+                           capture_output=True, text=True, timeout=10)
+        out["recent_logs"] = r.stdout
+    except Exception as e: out["recent_logs"] = f"ERR: {e}"
+    return {"status": "ok", "info": out}
+
+def action_check_orchestrators():
+    """Cherche tous les scripts shell détachés qui pourraient lancer des choses."""
+    out = {}
+    try:
+        # Tous les bash scripts dans /tmp avec leur PID
+        r = subprocess.run(["bash", "-c",
+            "ls -la /tmp/*.sh 2>/dev/null; echo '---'; "
+            "ps -eo pid,ppid,etime,cmd | grep -E 'bash.*\\.sh|systemctl' | grep -v grep"],
+            capture_output=True, text=True, timeout=5)
+        out["scripts_and_processes"] = r.stdout
+    except Exception as e: out["scripts_and_processes"] = f"ERR: {e}"
+    # Toutes les unit files créées
+    try:
+        r = subprocess.run(["bash", "-c",
+            "ls -la /etc/systemd/system/ | grep -v '^d'"],
+            capture_output=True, text=True, timeout=5)
+        out["unit_files"] = r.stdout
+    except Exception as e: out["unit_files"] = f"ERR: {e}"
+    # Vérifier le contenu réel des unit files installés
+    try:
+        r = subprocess.run(["cat", "/etc/systemd/system/cloudflared_tunnel.service"],
+                           capture_output=True, text=True, timeout=5)
+        out["cloudflared_unit_actual"] = r.stdout
+    except Exception as e: out["cloudflared_unit_actual"] = f"ERR: {e}"
+    return {"status": "ok", "checks": out}
+
+def action_final_clean():
+    """Nettoyage atomique propre, avec vérifications à chaque étape."""
+    script = """#!/bin/bash
+set -u
+exec >> /home/lolufe/assistant/handoff.log 2>&1
+echo ""
+echo "════════ FINAL_CLEAN $(date -Iseconds) ════════"
+echo "[T0] :"
+ps -eo pid,ppid,etime,cmd | grep -E 'tunnel_wrapper|cloudflared.tunnel.*localhost' | grep -v grep || true
+echo "─────"
+sleep 1
+
+# 1. Stop systemd (control-group kill)
+echo "[T1] systemctl stop"
+sudo -n systemctl stop cloudflared_tunnel.service
+echo "[T1+1s] :"
+sleep 1
+ps -eo pid,ppid,etime,cmd | grep -E 'tunnel_wrapper|cloudflared.tunnel.*localhost' | grep -v grep || echo "(rien)"
+echo "─────"
+
+# 2. Tuer les orphans hors cgroup avec retries
+for attempt in 1 2 3; do
+    pkill -TERM -f "tunnel_wrapper.sh" 2>/dev/null || true
+    pkill -TERM -f "cloudflared tunnel --url http://localhost:8501" 2>/dev/null || true
+    sleep 1
+    pkill -KILL -f "tunnel_wrapper.sh" 2>/dev/null || true
+    pkill -KILL -f "cloudflared tunnel --url http://localhost:8501" 2>/dev/null || true
+    sleep 1
+    REMAINING=$(pgrep -f 'tunnel_wrapper.sh|cloudflared tunnel.*localhost' | wc -l)
+    echo "[T2 attempt $attempt] remaining: $REMAINING"
+    if [ "$REMAINING" = "0" ]; then break; fi
+done
+
+# 3. ATTENTE longue : laisser tout se settle (10s)
+echo "[T3] settling 10s..."
+sleep 10
+echo "[T3+10s] :"
+ps -eo pid,ppid,etime,cmd | grep -E 'tunnel_wrapper|cloudflared.tunnel.*localhost' | grep -v grep || echo "(rien)"
+echo "─────"
+
+# 4. UN SEUL start
+echo "[T4] systemctl start"
+sudo -n systemctl start cloudflared_tunnel.service
+
+# 5. Attendre 12s pour que le tunnel se connecte
+sleep 12
+
+echo "[T4+12s] FINAL :"
+ps -eo pid,ppid,etime,cmd | grep -E 'tunnel_wrapper|cloudflared.tunnel.*localhost' | grep -v grep
+echo "[URL] : $(cat /home/lolufe/assistant/tunnel_url.txt 2>/dev/null)"
+
+# 6. Compter — si pas exactement 1 wrapper et 1 cloudflared, lever un drapeau
+W=$(pgrep -f 'tunnel_wrapper.sh' | wc -l)
+C=$(pgrep -f 'cloudflared tunnel.*localhost' | wc -l)
+echo "[CHECK] wrappers=$W cloudflared=$C"
+if [ "$W" = "1" ] && [ "$C" = "1" ]; then
+    echo "[OK] CLEAN_STATE_OK"
+else
+    echo "[FAIL] CLEAN_STATE_KO ($W wrappers, $C cloudflared)"
+fi
+echo "════════ FIN FINAL_CLEAN ════════"
+"""
+    p = "/tmp/final_clean.sh"
+    with open(p, "w") as f: f.write(script)
+    os.chmod(p, 0o755)
+    subprocess.Popen(["bash", p], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    log_deploy("🧹 Final clean programmé (~28s)")
+    return {"status": "ok", "message": "Final clean en cours, attendre ~32s"}
+
+
+def action_admin_clean_double_tunnel():
+    """Tue tous les wrappers/cloudflared et laisse systemd démarrer UN seul service.
+    Détaché car coupe notre canal."""
+    script = """#!/bin/bash
+set -u
+exec >> /home/lolufe/assistant/handoff.log 2>&1
+echo ""
+echo "════════ CLEAN_DOUBLE $(date -Iseconds) ════════"
+echo "[PRE] :"
+pgrep -af tunnel_wrapper || true
+pgrep -af "cloudflared tunnel" || true
+sleep 2
+# Stopper proprement le service (KillMode=control-group tue toute la cgroup)
+sudo -n systemctl stop cloudflared_tunnel.service
+sleep 2
+# Tuer ce qui reste (orphans hors cgroup)
+pkill -TERM -f "tunnel_wrapper.sh" 2>/dev/null || true
+pkill -TERM -f "cloudflared tunnel --url http://localhost:8501" 2>/dev/null || true
+sleep 2
+pkill -KILL -f "tunnel_wrapper.sh" 2>/dev/null || true
+pkill -KILL -f "cloudflared tunnel --url http://localhost:8501" 2>/dev/null || true
+echo "[MID] (après pkill, avant start) :"
+pgrep -af tunnel_wrapper || true
+pgrep -af "cloudflared tunnel" || true
+sleep 1
+# Démarrer UN seul service
+sudo -n systemctl start cloudflared_tunnel.service
+# Attendre la stabilisation (15s)
+sleep 15
+echo "[POST T+15s] :"
+pgrep -af tunnel_wrapper || true
+pgrep -af "cloudflared tunnel" || true
+echo "[URL] : $(cat /home/lolufe/assistant/tunnel_url.txt 2>/dev/null)"
+echo "════════ FIN CLEAN_DOUBLE ════════"
+"""
+    p = "/tmp/clean_double.sh"
+    with open(p, "w") as f: f.write(script)
+    os.chmod(p, 0o755)
+    subprocess.Popen(["bash", p], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    log_deploy("🧹 Clean double tunnel programmé (~22s)")
+    return {"status": "ok", "message": "Clean en cours, attendre ~25s",
+            "expected_new_url": "publiée sur ntfy.sh"}
+
+
+def action_admin_restart_tunnel():
+    """Tue tous les processes tunnel et redémarre proprement via systemd.
+    Détaché car peut couper notre propre canal."""
+    script = """#!/bin/bash
+set -u
+exec >> /home/lolufe/assistant/handoff.log 2>&1
+echo ""
+echo "════════ TUNNEL_RESTART $(date -Iseconds) ════════"
+echo "[PRE] tunnel processes :"
+pgrep -af tunnel_wrapper || true
+pgrep -af "cloudflared tunnel" || true
+
+# 1. Stopper le service systemd (KillMode=control-group tue toute la cgroup)
+sudo -n systemctl stop cloudflared_tunnel.service
+sleep 2
+
+# 2. Tuer les éventuels orphans hors cgroup (ceux d'avant la migration)
+pkill -TERM -f "tunnel_wrapper.sh" 2>/dev/null || true
+pkill -TERM -f "cloudflared tunnel --url http://localhost:8501" 2>/dev/null || true
+sleep 2
+pkill -KILL -f "tunnel_wrapper.sh" 2>/dev/null || true
+pkill -KILL -f "cloudflared tunnel --url http://localhost:8501" 2>/dev/null || true
+sleep 1
+
+# 3. Démarrer fraîchement
+sudo -n systemctl start cloudflared_tunnel.service
+sleep 8
+
+echo "[POST] tunnel processes :"
+pgrep -af tunnel_wrapper || true
+pgrep -af "cloudflared tunnel" || true
+echo "[POST] URL : $(cat /home/lolufe/assistant/tunnel_url.txt 2>/dev/null)"
+echo "════════ FIN TUNNEL_RESTART ════════"
+"""
+    p = "/tmp/tunnel_restart.sh"
+    with open(p, "w") as f: f.write(script)
+    os.chmod(p, 0o755)
+    subprocess.Popen(["bash", p], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    log_deploy("🔄 Tunnel restart programmé (~12s)")
+    return {"status": "ok", "message": "Tunnel restart en cours, attendre ~15s",
+            "expected_new_url": "publiée sur ntfy.sh"}
+
+
+def action_admin_cleanup():
+    """Stoppe services + tue tous les orphans tunnel/cloudflared.
+    Ne touche PAS au process courant."""
+    actions = []
+    for cmd, label in [
+        (["sudo", "-n", "systemctl", "stop", "deploy_server.service"], "stop deploy_server"),
+        (["sudo", "-n", "systemctl", "stop", "cloudflared_tunnel.service"], "stop tunnel"),
+    ]:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            actions.append({"step": label, "rc": r.returncode, "err": r.stderr.strip()[:200]})
+        except Exception as e:
+            actions.append({"step": label, "error": str(e)})
+    time.sleep(1)
+    # Tuer orphans (sans sudo, je suis lolufe)
+    for pattern in ["tunnel_wrapper.sh", "cloudflared tunnel --url http://localhost:8501"]:
+        try:
+            r = subprocess.run(["pkill", "-9", "-f", pattern],
+                               capture_output=True, text=True, timeout=5)
+            actions.append({"step": f"pkill {pattern}", "rc": r.returncode})
+        except Exception as e:
+            actions.append({"step": f"pkill {pattern}", "error": str(e)})
+    # Re-vérification
+    diag = action_diag_processes()
+    return {"status": "ok", "actions": actions, "after": diag["diag"]}
+
+def action_cgroups():
+    """Pour chaque tunnel_wrapper et cloudflared, montre sa cgroup systemd."""
+    out = []
+    try:
+        r = subprocess.run(["bash", "-c",
+            "for p in $(pgrep -f 'tunnel_wrapper.sh|cloudflared tunnel.*localhost'); do "
+            "  echo \"=== PID $p ===\"; "
+            "  cat /proc/$p/cgroup 2>/dev/null || echo '(no cgroup)'; "
+            "done"],
+            capture_output=True, text=True, timeout=5)
+        return {"status": "ok", "output": r.stdout}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+def action_psgroups():
+    """Affiche pid, ppid, pgid, sid, uid, etime, cmd pour les wrappers."""
+    try:
+        r = subprocess.run(
+            ["bash", "-c", "ps -eo pid,ppid,pgid,sid,euser,etime,cmd | grep -E 'tunnel_wrapper|cloudflared.tunnel.*localhost' | grep -v grep"],
+            capture_output=True, text=True, timeout=5)
+        return {"status": "ok", "lines": r.stdout.strip().split("\n")}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+def action_check_autostart():
+    """Détecte tout ce qui pourrait lancer tunnel_wrapper.sh automatiquement."""
+    out = {}
+    # Crontab user
+    try:
+        r = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=5)
+        out["crontab_user"] = r.stdout if r.returncode == 0 else f"none ({r.stderr.strip()[:80]})"
+    except Exception as e: out["crontab_user"] = f"ERR: {e}"
+    # Crontabs système
+    try:
+        r = subprocess.run(["bash", "-c", "ls -la /etc/cron.* /etc/crontab 2>/dev/null && grep -r tunnel /etc/cron.* /etc/crontab 2>/dev/null"],
+                           capture_output=True, text=True, timeout=5)
+        out["crontab_system"] = r.stdout
+    except Exception as e: out["crontab_system"] = f"ERR: {e}"
+    # systemd timers
+    try:
+        r = subprocess.run(["systemctl", "list-timers", "--no-pager"],
+                           capture_output=True, text=True, timeout=5)
+        out["systemd_timers"] = r.stdout
+    except Exception as e: out["systemd_timers"] = f"ERR: {e}"
+    # Search for tunnel_wrapper in any startup script
+    try:
+        r = subprocess.run(["bash", "-c",
+            "grep -rl tunnel_wrapper /etc/systemd /home/lolufe 2>/dev/null | head -20"],
+            capture_output=True, text=True, timeout=10)
+        out["files_referencing_wrapper"] = r.stdout.strip().split("\n")
+    except Exception as e: out["files_referencing_wrapper"] = f"ERR: {e}"
+    # bashrc, profile, etc
+    try:
+        r = subprocess.run(["bash", "-c",
+            "grep -l 'tunnel_wrapper\|cloudflared\|deploy_server' /home/lolufe/.bashrc /home/lolufe/.profile /home/lolufe/.bash_profile /etc/rc.local 2>/dev/null"],
+            capture_output=True, text=True, timeout=5)
+        out["shell_init_files"] = r.stdout
+    except Exception as e: out["shell_init_files"] = f"ERR: {e}"
+    return {"status": "ok", "checks": out}
+
+def action_pstree():
+    """pstree pour voir l'arborescence complète des wrappers et cloudflared."""
+    results = {}
+    for label, pid_pattern in [("tunnel_wrappers", "tunnel_wrapper.sh"),
+                                ("cloudflared", "cloudflared tunnel")]:
+        try:
+            r = subprocess.run(
+                ["bash", "-c", f"pgrep -f '{pid_pattern}' | head -10 | while read p; do echo '--- PID '$p; pstree -p $p; done"],
+                capture_output=True, text=True, timeout=5)
+            results[label] = r.stdout.strip().split("\n")
+        except Exception as e:
+            results[label] = [str(e)]
+    return {"status": "ok", "trees": results}
+
+def action_journalctl(service, n=30):
+    """Lit les n derniers logs systemd d'un service."""
+    try:
+        r = subprocess.run(
+            ["journalctl", "-u", service, "-n", str(n), "--no-pager", "-o", "short-iso"],
+            capture_output=True, text=True, timeout=10)
+        return {"status": "ok", "service": service,
+                "lines": r.stdout.split("\n"),
+                "stderr": r.stderr.strip()[:500]}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+def action_diag_processes():
+    """Inventaire processes liés à deploy_server, cloudflared, tunnel_wrapper.
+    Format: PID PPID CMD pour comprendre les arborescences."""
+    out = {}
+    for pattern in ["deploy_server.py", "cloudflared", "tunnel_wrapper"]:
+        try:
+            # ps avec PID, PPID pour voir les relations
+            r = subprocess.run(
+                ["bash", "-c", f"pgrep -f '{pattern}' | xargs -r ps -o pid,ppid,etime,cmd -p"],
+                capture_output=True, text=True, timeout=5)
+            out[pattern] = [l for l in r.stdout.strip().split("\n") if l]
+        except Exception as e:
+            out[pattern] = [f"ERR: {e}"]
+    # Qui écoute sur 8501 ?
+    try:
+        r = subprocess.run(["ss", "-tlnp", "sport", "=", ":8501"],
+                           capture_output=True, text=True, timeout=5)
+        out["port_8501"] = r.stdout.strip().split("\n")
+    except Exception as e:
+        out["port_8501"] = [f"ERR: {e}"]
+    out["my_pid"] = os.getpid()
+    return {"status": "ok", "diag": out}
+
 def action_probe_sudo():
     """Test non-destructif des droits sudo requis pour le bootstrap infra."""
-    tests = [(["sudo", "-n", "-l"], "sudo_-l")]
+    # Créer un fichier de test pour la commande cp
+    try:
+        with open("/tmp/test.service", "w") as _f:
+            _f.write("[Unit]\nDescription=Probe Test\n")
+    except Exception:
+        pass
+    tests = [
+        (["sudo", "-n", "systemctl", "is-active", "deploy_server.service"], "sc_is-active"),
+        (["sudo", "-n", "systemctl", "daemon-reload"], "sc_daemon-reload"),
+        (["sudo", "-n", "systemctl", "enable", "deploy_server.service"], "sc_enable"),
+        (["sudo", "-n", "cp", "/tmp/test.service", "/etc/systemd/system/test.service"], "cp_unit"),
+        (["sudo", "-n", "cp", "/etc/hostname", "/tmp/__sudo_cp_probe"], "cp_arbitrary_should_fail"),
+    ]
     results = {}
     for cmd, label in tests:
         try:
@@ -308,9 +832,12 @@ def action_probe_sudo():
         except Exception as e:
             results[label] = {"error": str(e)[:200]}
     # Nettoyage
-    try: subprocess.run(["sudo", "-n", "rm", "-f", "/tmp/__sudo_cp_probe"],
-                        capture_output=True, timeout=5)
-    except: pass
+    for cleanup in [
+        ["sudo", "-n", "rm", "/etc/systemd/system/test.service"],
+        ["rm", "-f", "/tmp/test.service", "/tmp/__sudo_cp_probe"],
+    ]:
+        try: subprocess.run(cleanup, capture_output=True, timeout=5)
+        except: pass
     ok = all(r.get("rc") == 0 for r in results.values())
     return {"status": "ok" if ok else "partial", "can_bootstrap": ok, "tests": results}
 
@@ -340,15 +867,80 @@ def action_infra_install():
         if r.returncode != 0:
             return {"status": "error", "steps": steps}
 
-        for svc in ["deploy_server.service", "cloudflared_tunnel.service"]:
+        # Watchdog : service + timer
+        with open("/tmp/infra_watchdog.service", "w") as f:
+            f.write(WATCHDOG_SERVICE_UNIT)
+        with open("/tmp/infra_watchdog.timer", "w") as f:
+            f.write(WATCHDOG_TIMER_UNIT)
+        for fname in ["infra_watchdog.service", "infra_watchdog.timer"]:
+            r = subprocess.run(
+                ["sudo", "-n", "cp", f"/tmp/{fname}",
+                 f"/etc/systemd/system/{fname}"],
+                capture_output=True, text=True, timeout=10)
+            steps.append((f"cp {fname}", r.returncode, (r.stderr or "").strip()[:200]))
+            if r.returncode != 0:
+                return {"status": "error", "steps": steps}
+
+        # Écrire le script watchdog (exécutable par lolufe, pas besoin de sudo)
+        watchdog_script = """#!/bin/bash
+# Watchdog AssistantIA — vérifie deploy_server local + tunnel externe
+LOG="/home/lolufe/assistant/watchdog.log"
+URL_FILE="/home/lolufe/assistant/tunnel_url.txt"
+STATE_FILE="/home/lolufe/assistant/watchdog.state"
+
+log() { echo "[$(date -Iseconds)] $*"; }
+
+# 1. Test deploy_server local
+if ! curl -sf -m 5 http://127.0.0.1:8501/ping >/dev/null 2>&1; then
+    log "❌ deploy_server local KO → restart"
+    sudo -n systemctl restart deploy_server.service
+    echo "deploy_restarted=$(date -Iseconds)" > "$STATE_FILE"
+    exit 0
+fi
+
+# 2. Test tunnel externe
+URL=$(cat "$URL_FILE" 2>/dev/null)
+if [ -z "$URL" ]; then
+    log "⚠️  pas d'URL dans $URL_FILE → restart tunnel"
+    sudo -n systemctl restart cloudflared_tunnel.service
+    exit 0
+fi
+
+# 3. Test ping via le tunnel (curl ne suit pas l'auth donc on accepte 401)
+HTTP=$(curl -s -m 8 -o /dev/null -w "%{http_code}" "$URL/ping" 2>/dev/null)
+if [ "$HTTP" != "401" ] && [ "$HTTP" != "200" ]; then
+    log "⚠️  tunnel KO (HTTP=$HTTP) sur $URL → restart"
+    sudo -n systemctl restart cloudflared_tunnel.service
+    echo "tunnel_restarted=$(date -Iseconds)" > "$STATE_FILE"
+fi
+
+# Tronquer le log s'il dépasse 200KB
+SIZE=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
+if [ "$SIZE" -gt 204800 ]; then
+    tail -500 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi
+"""
+        with open("/home/lolufe/assistant/watchdog.sh", "w") as f:
+            f.write(watchdog_script)
+        os.chmod("/home/lolufe/assistant/watchdog.sh", 0o755)
+        steps.append(("write watchdog.sh", 0, ""))
+
+        # daemon-reload + enable + start timer
+        subprocess.run(["sudo", "-n", "systemctl", "daemon-reload"], timeout=10, capture_output=True)
+        for svc in ["deploy_server.service", "cloudflared_tunnel.service", "infra_watchdog.timer"]:
             r = subprocess.run(["sudo", "-n", "systemctl", "enable", svc],
                                capture_output=True, text=True, timeout=10)
             steps.append((f"enable {svc}", r.returncode,
                           (r.stderr or r.stdout or "").strip()[:200]))
+        # Démarrer le timer (les services sont déjà actifs)
+        r = subprocess.run(["sudo", "-n", "systemctl", "start", "infra_watchdog.timer"],
+                           capture_output=True, text=True, timeout=10)
+        steps.append(("start infra_watchdog.timer", r.returncode, (r.stderr or "").strip()[:200]))
 
-        log_deploy("✅ Systemd units installés + activés au boot")
+        log_deploy("✅ Systemd units + watchdog installés + activés au boot")
         return {"status": "ok", "steps": steps,
-                "installed": ["deploy_server.service", "cloudflared_tunnel.service"]}
+                "installed": ["deploy_server.service", "cloudflared_tunnel.service",
+                              "infra_watchdog.service", "infra_watchdog.timer"]}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -400,27 +992,120 @@ def action_infra_status():
 
 
 def action_infra_handoff():
-    """Tue le process actuel (nohup) et laisse systemd démarrer une instance fraîche.
-    Script lancé en arrière-plan détaché → réponse envoyée avant la mort du process."""
+    """Handoff atomique vers systemd. Stratégie :
+    1. Réponse envoyée tout de suite
+    2. Script détaché : kill les nohup orphans, attend qu'ils meurent,
+       démarre les services systemd, vérifie leur santé,
+       republie l'URL sur ntfy SI tout va bien.
+    """
     my_pid = os.getpid()
     script = f"""#!/bin/bash
 set -u
+exec >> /home/lolufe/assistant/handoff.log 2>&1
+echo ""
+echo "════════ HANDOFF $(date -Iseconds) ════════"
+echo "[PRE] my_pid (deploy_server à tuer): {my_pid}"
+echo "[PRE] processes deploy_server :"
+pgrep -af deploy_server.py || true
+echo "[PRE] processes tunnel :"
+pgrep -af tunnel_wrapper || true
+pgrep -af "cloudflared tunnel" || true
+echo "[PRE] port 8501 :"
+ss -tlnp sport = :8501 || true
+
+# Laisse le temps à la réponse HTTP de partir
 sleep 3
-# Étape 1: démarrer le service systemd (échouera à bind le port tant qu'on vit,
-# mais Restart=always retentera après notre mort)
-sudo -n systemctl start deploy_server.service 2>&1 | logger -t infra_handoff
-# Étape 2: tuer le process courant (nohup orphan)
-sudo -n kill -TERM {my_pid} 2>&1 | logger -t infra_handoff
+
+# 1. Tuer TOUS les wrappers et cloudflared orphans (lolufe peut le faire sans sudo)
+echo "[KILL] orphans tunnel..."
+pkill -TERM -f "tunnel_wrapper.sh" 2>/dev/null || true
+pkill -TERM -f "cloudflared tunnel --url http://localhost:8501" 2>/dev/null || true
 sleep 2
-# Étape 3: s'assurer que systemd a bien rebind
-sudo -n systemctl restart deploy_server.service 2>&1 | logger -t infra_handoff
-# Étape 4: handoff tunnel aussi
-sleep 1
-# Tuer les éventuels orphans cloudflared + tunnel_wrapper
-pkill -TERM -f "tunnel_wrapper.sh" 2>&1 | logger -t infra_handoff || true
-pkill -TERM -f "cloudflared tunnel --url http://localhost:8501" 2>&1 | logger -t infra_handoff || true
+pkill -KILL -f "tunnel_wrapper.sh" 2>/dev/null || true
+pkill -KILL -f "cloudflared tunnel --url http://localhost:8501" 2>/dev/null || true
+
+# 2. Tuer mon process (libère port 8501)
+echo "[KILL] my deploy_server pid {my_pid}"
+kill -TERM {my_pid} 2>/dev/null || true
 sleep 2
-sudo -n systemctl restart cloudflared_tunnel.service 2>&1 | logger -t infra_handoff
+kill -KILL {my_pid} 2>/dev/null || true
+
+# 3. Vérifier que le port est libre
+for i in 1 2 3 4 5; do
+    if ! ss -tln sport = :8501 | grep -q LISTEN; then
+        echo "[OK] port 8501 libre"
+        break
+    fi
+    echo "[WAIT] port 8501 encore pris (essai $i/5)"
+    sleep 1
+done
+
+# 4. Démarrer deploy_server.service
+echo "[START] deploy_server.service"
+sudo -n systemctl start deploy_server.service
+sleep 3
+
+# 5. Vérifier qu'il répond
+DEPLOY_OK=0
+for i in 1 2 3 4 5; do
+    if curl -sf -m 3 -H "Authorization: Bearer ${{DS_SECRET:-}}" http://127.0.0.1:8501/ping >/dev/null 2>&1; then
+        DEPLOY_OK=1
+        echo "[OK] deploy_server répond (essai $i)"
+        break
+    fi
+    # Pas de secret en env, test sans auth juste pour voir si ça écoute
+    if curl -s -m 3 http://127.0.0.1:8501/ping 2>/dev/null | grep -q -E "(alive|Non autorisé)"; then
+        DEPLOY_OK=1
+        echo "[OK] deploy_server écoute (essai $i)"
+        break
+    fi
+    sleep 2
+done
+
+if [ "$DEPLOY_OK" != "1" ]; then
+    echo "[FAIL] deploy_server ne répond pas après 5 essais"
+    sudo -n systemctl status deploy_server.service --no-pager || true
+fi
+
+# 6. Démarrer le tunnel
+echo "[START] cloudflared_tunnel.service"
+sudo -n systemctl start cloudflared_tunnel.service
+
+# 7. Attendre l'URL (max 30s)
+URL=""
+for i in $(seq 1 30); do
+    if [ -f /home/lolufe/assistant/tunnel_url.txt ]; then
+        CANDIDATE=$(cat /home/lolufe/assistant/tunnel_url.txt 2>/dev/null)
+        # On veut une URL fraîche, donc on regarde la mtime du fichier
+        FILE_AGE=$(($(date +%s) - $(stat -c %Y /home/lolufe/assistant/tunnel_url.txt 2>/dev/null || echo 0)))
+        if [ -n "$CANDIDATE" ] && [ "$FILE_AGE" -lt 60 ]; then
+            URL="$CANDIDATE"
+            echo "[OK] URL publiée par tunnel ($FILE_AGE s) : $URL"
+            break
+        fi
+    fi
+    sleep 1
+done
+
+if [ -z "$URL" ]; then
+    echo "[WARN] URL tunnel pas publiée après 30s — wrapper a peut-être échoué"
+    sudo -n systemctl status cloudflared_tunnel.service --no-pager || true
+fi
+
+# 8. État final
+echo ""
+echo "[FINAL] processes deploy_server :"
+pgrep -af deploy_server.py || true
+echo "[FINAL] processes tunnel :"
+pgrep -af tunnel_wrapper || true
+pgrep -af "cloudflared tunnel" || true
+echo "[FINAL] port 8501 :"
+ss -tlnp sport = :8501 || true
+echo "[FINAL] services :"
+echo "  deploy_server : $(sudo -n systemctl is-active deploy_server.service)"
+echo "  tunnel        : $(sudo -n systemctl is-active cloudflared_tunnel.service)"
+echo "[FINAL] URL : $URL"
+echo "════════ FIN HANDOFF $(date -Iseconds) ════════"
 """
     script_path = "/tmp/infra_handoff.sh"
     with open(script_path, "w") as f:
@@ -570,6 +1255,37 @@ class DeployHandler(BaseHTTPRequestHandler):
             self._respond(200, {"status": "ok", "message": "deploy_server v2 alive"})
         elif self.path == "/infra_status":
             self._respond(200, action_infra_status())
+        elif self.path == "/admin_cleanup":
+            self._respond(200, action_admin_cleanup())
+        elif self.path == "/admin_restart_tunnel":
+            self._respond(200, action_admin_restart_tunnel())
+        elif self.path == "/admin_clean_double":
+            self._respond(200, action_admin_clean_double_tunnel())
+        elif self.path == "/final_clean":
+            self._respond(200, action_final_clean())
+        elif self.path == "/check_orchestrators":
+            self._respond(200, action_check_orchestrators())
+        elif self.path == "/inspect_old_cloudflared":
+            self._respond(200, action_inspect_old_cloudflared())
+        elif self.path == "/eliminate_duplicate":
+            self._respond(200, action_eliminate_duplicate())
+        elif self.path == "/test_kill_wrapper":
+            self._respond(200, action_test_kill_wrapper())
+        elif self.path == "/timer_status":
+            self._respond(200, action_timer_status())
+        elif self.path == "/kill_zombies":
+            self._respond(200, action_kill_zombies())
+        elif self.path == "/diag_processes":
+            self._respond(200, action_diag_processes())
+        elif self.path.startswith("/journalctl/"):
+            svc = self.path[len("/journalctl/"):].split("?")[0]
+            self._respond(200, action_journalctl(svc))
+        elif self.path == "/pstree":
+            self._respond(200, action_pstree())
+        elif self.path == "/check_autostart":
+            self._respond(200, action_check_autostart())
+        elif self.path == "/psgroups":
+            self._respond(200, action_psgroups())
         elif self.path == "/sudo_probe":
             self._respond(200, action_probe_sudo())
         elif self.path.startswith("/ls"):
