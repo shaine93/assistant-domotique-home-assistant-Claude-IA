@@ -1,0 +1,41 @@
+# ═══ Secrets — NE JAMAIS COMMIT ═══
+config.json
+config.json.bak
+config.json.bak.*
+.env
+
+# ═══ Données utilisateur ═══
+memory.db
+memory.db.broken
+memory.db.backup
+*.log
+*.log.*
+tunnel_url.txt
+watchdog.state
+
+# ═══ Backups et versions ═══
+backups/
+versions/
+*.bak
+*.bak.*
+
+# ═══ Docker ═══
+data/
+
+# ═══ Python ═══
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.coverage
+
+# ═══ Outils ═══
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# ═══ Runtime ═══
+handoff.log
+repo_cleanup.log
