@@ -9,14 +9,16 @@
 set -euo pipefail
 
 # ── Couleurs ──────────────────────────────────────────────────────────
-BLUE="\033[1;34m"; GREEN="\033[1;32m"; YELLOW="\033[1;33m"
-RED="\033[1;31m"; NC="\033[0m"; BOLD="\033[1m"
+# On utilise $'...' pour que les séquences ANSI soient interprétées dès
+# l'assignation — elles fonctionnent ainsi avec cat, printf, echo.
+BLUE=$'\033[1;34m'; GREEN=$'\033[1;32m'; YELLOW=$'\033[1;33m'
+RED=$'\033[1;31m'; NC=$'\033[0m'; BOLD=$'\033[1m'
 
-info()  { echo -e "${BLUE}ℹ ${NC}$*"; }
-ok()    { echo -e "${GREEN}✓ ${NC}$*"; }
-warn()  { echo -e "${YELLOW}⚠ ${NC}$*"; }
-fail()  { echo -e "${RED}✗ ${NC}$*" >&2; exit 1; }
-title() { echo -e "\n${BOLD}═══ $* ═══${NC}"; }
+info()  { printf '%sℹ %s%s\n' "$BLUE" "$NC" "$*"; }
+ok()    { printf '%s✓ %s%s\n' "$GREEN" "$NC" "$*"; }
+warn()  { printf '%s⚠ %s%s\n' "$YELLOW" "$NC" "$*"; }
+fail()  { printf '%s✗ %s%s\n' "$RED" "$NC" "$*" >&2; exit 1; }
+title() { printf '\n%s═══ %s ═══%s\n' "$BOLD" "$*" "$NC"; }
 
 # ── Répertoires ───────────────────────────────────────────────────────
 INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
