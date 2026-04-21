@@ -1,50 +1,44 @@
 #!/bin/bash
 set -u
-LOG=/home/lolufe/assistant/repo_cleanup.log
-exec >> "$LOG" 2>&1
-echo ""
-echo "════════ V2_PUSH $(date -Iseconds) ════════"
+LOG=/home/lolufe/assistant/scripts/e2e_test.log
+exec > "$LOG" 2>&1
+echo "════════ README v2 UPDATE $(date -Iseconds) ════════"
 cd /home/lolufe/assistant
 
-# Désactiver le cron temporairement
+# Désactiver cron
 crontab -l > /tmp/crontab.backup 2>/dev/null || true
 crontab -l 2>/dev/null | grep -v 'git_sync.sh' | crontab - 2>/dev/null || true
 
-# Ajouter tous les nouveaux fichiers
-git add README.md requirements.txt env.example install.sh Dockerfile \
-        docker-compose.yml assistantia.service.template LICENSE \
-        scripts/ docs/ addon/Dockerfile addon/config.yaml addon/run.sh
+git add README.md
 
-# Supprimer les obsolètes (déjà retirés du disque via /delete)
-git add -u addon/Dockerfile.txt assistantia.service.txt 2>/dev/null || true
+# Vérifier qu'il y a bien quelque chose à commiter
+if git diff --cached --quiet; then
+    echo "(aucun changement)"
+else
+    git commit -m "README v2: retrait des promesses de ROI non tenables
 
-# État avant commit
-echo "--- git status ---"
-git status -s
+Refonte du README suite aux retours du forum HACF (5 avril 2026) :
+- Retrait de la promesse ×10 à ×20 et des chiffres d'économies typiques
+  qui ne peuvent pas etre garantis selon l'installation
+- Repositionnement : agent IA conversationnel, pas machine a economies
+- Ajout d'une section explicite 'En quoi c'est different d'une automation
+  classique ?' pour repondre a la question de la valeur ajoutee
+- Ajout de la roadmap Groq/Ollama en reponse aux objections de cout API
+- Section 'Etat du projet' explicitant le statut beta honnetement
+- Le script mesure toujours ses economies via /roi, l'utilisateur
+  juge du rapport cout/benefice avec ses propres chiffres" 2>&1 | tail -3
+fi
 
-# Commit
-git commit -m "Install v2.0: proper README, 4 install methods, docs/, scripts/, LICENSE, .gitignore
-
-- Nouveau README propre pointant vers le vrai repo
-- 4 méthodes d'install documentées : HA Add-on, Docker, Linux natif, manuel
-- install.sh : wizard CLI interactif (genère config.json)
-- Dockerfile racine + docker-compose.yml propre
-- scripts/install_systemd.sh : deploy comme service système
-- scripts/enable_beta_channel.sh : opt-in pour le mode bêta-testeur
-- docs/ : INSTALL, CONFIGURATION, TROUBLESHOOTING, BETA_CHANNEL
-- addon/Dockerfile : renommé de .txt (HA Add-on Store le veut sans extension)
-- addon/config.yaml : vraie URL GitHub + flag enable_deploy_server opt-in
-- LICENSE : MIT
-- Secrets rotés, deploy_server désactivé par défaut (opt-in)" || echo "(rien à commiter)"
-
+echo ""
 echo "--- git log ---"
 git log --oneline -3
 
-# Push
+echo ""
 echo "--- git push ---"
-git push origin main 2>&1 | tail -10
+git push origin main 2>&1 | tail -5
 
-# Réactiver le cron
+# Reactiver cron
 crontab /tmp/crontab.backup 2>/dev/null || true
 
-echo "════════ FIN V2_PUSH $(date -Iseconds) ════════"
+echo ""
+echo "════════ FIN $(date -Iseconds) ════════"
