@@ -102,7 +102,9 @@ WantedBy=multi-user.target
 """
 
 
-ALLOWED_EXTENSIONS = {".py", ".md", ".txt", ".json", ".yaml", ".yml", ".sh", ".cfg", ".ini", ".log"}
+ALLOWED_EXTENSIONS = {".py", ".md", ".txt", ".json", ".yaml", ".yml", ".sh", ".cfg", ".ini", ".log", ".example", ".template", ".service", ".toml"}
+# Fichiers sans extension autorisés (Dockerfile, LICENSE, Makefile, etc.)
+ALLOWED_NO_EXT = {"Dockerfile", "LICENSE", "Makefile", ".gitignore", ".dockerignore", "requirements"}
 FORBIDDEN_PATHS = {"config.json"}
 
 def load_config():
@@ -208,8 +210,9 @@ def action_write_file(data):
     if not resolved:
         return {"status": "error", "message": f"Chemin non autorisé: {filepath}"}
     _, ext = os.path.splitext(resolved)
-    if ext.lower() not in ALLOWED_EXTENSIONS:
-        return {"status": "error", "message": f"Extension non autorisée: {ext}"}
+    basename_check = os.path.basename(resolved)
+    if ext.lower() not in ALLOWED_EXTENSIONS and basename_check not in ALLOWED_NO_EXT:
+        return {"status": "error", "message": f"Extension non autorisée: {ext} (basename: {basename_check})"}
     basename = os.path.basename(resolved)
     if basename in FORBIDDEN_PATHS:
         return {"status": "error", "message": f"Fichier protégé: {basename}"}
@@ -225,6 +228,41 @@ def action_write_file(data):
                 "size_kb": round(len(content) / 1024, 1), "timestamp": datetime.now().isoformat()}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+def action_run_v2_push():
+    """Lance scripts/v2_push.sh en détaché."""
+    script_path = os.path.join(ASSISTANT_DIR, "scripts", "v2_push.sh")
+    if not os.path.exists(script_path):
+        return {"status": "error", "message": "scripts/v2_push.sh manquant"}
+    subprocess.Popen(["bash", script_path], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return {"status": "ok", "message": "v2_push lancé — attendre 30s"}
+
+
+def action_chmod(data):
+    """chmod sur un fichier (whitelist, +x seulement pour sécu)."""
+    filepath = data.get("path", "")
+    mode = data.get("mode", "")
+    if not filepath or not mode:
+        return {"status": "error", "message": "path et mode requis"}
+    if ".." in filepath or filepath.startswith("/"):
+        return {"status": "error", "message": "Chemin interdit"}
+    full_path = os.path.join(ASSISTANT_DIR, filepath)
+    if not os.path.exists(full_path):
+        return {"status": "error", "message": f"Fichier introuvable: {filepath}"}
+    if mode not in ["0o755", "755", "+x", "0o644", "644", "0o600", "600"]:
+        return {"status": "error", "message": "Mode non autorisé"}
+    try:
+        if mode in ["0o755", "755", "+x"]:
+            os.chmod(full_path, 0o755)
+        elif mode in ["0o644", "644"]:
+            os.chmod(full_path, 0o644)
+        elif mode in ["0o600", "600"]:
+            os.chmod(full_path, 0o600)
+        return {"status": "ok", "path": filepath, "mode": oct(os.stat(full_path).st_mode)[-3:]}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 
 def action_delete_file(data):
     """Supprime un fichier du dossier assistant (sécurisé)"""
@@ -1321,6 +1359,10 @@ class DeployHandler(BaseHTTPRequestHandler):
             self._respond(200, action_write_file(data))
         elif self.path == "/delete":
             self._respond(200, action_delete_file(data))
+        elif self.path == "/chmod":
+            self._respond(200, action_chmod(data))
+        elif self.path == "/run_v2_push":
+            self._respond(200, action_run_v2_push())
         elif self.path == "/deploy":
             patch_result = action_patch(data)
             if patch_result["status"] != "ok":
