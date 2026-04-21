@@ -1,0 +1,9 @@
+# AssistantIA Domotique — Dépendances Python
+# Compatible Python 3.10+
+
+anthropic>=0.40.0
+requests>=2.31.0
+matplotlib>=3.7.0
+
+# Optionnel — pour les tests
+# pytest>=7.4.0

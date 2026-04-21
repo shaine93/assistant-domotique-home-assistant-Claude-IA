@@ -1,10 +1,28 @@
-version: "3"
 services:
   assistantia:
-    image: ghcr.io/votre-repo/assistantia-domotique:latest
+    # Option 1 : construire l'image localement depuis le Dockerfile
+    build: .
+
+    # Option 2 : utiliser l'image pré-construite depuis GitHub Container Registry
+    # (décommentez la ligne ci-dessous et commentez "build: ." ci-dessus)
+    # image: ghcr.io/shaine93/assistant-domotique-home-assistant-claude-ia:latest
+
     container_name: assistantia
     restart: unless-stopped
+
     volumes:
+      # Persistance : config.json, memory.db, logs
       - ./data:/app/data
-    ports:
-      - "8501:8501"
+
+    # Charger les variables depuis .env (copiez env.example en .env d'abord)
+    env_file:
+      - .env
+
+    # Fuseau horaire pour les briefings matin, bilans soir, etc.
+    environment:
+      - TZ=Europe/Paris
+
+    # Mode bêta-testeur (opt-in) : expose le deploy_server pour recevoir des patches.
+    # Décommentez la ligne ports ci-dessous UNIQUEMENT si vous avez lu docs/BETA_CHANNEL.md
+    # ports:
+    #   - "127.0.0.1:8501:8501"

@@ -1,150 +1,168 @@
+<h1 align="center">🏠 AssistantIA Domotique</h1>
+<p align="center"><strong>L'antivirus de votre maison — propulsé par Claude AI</strong></p>
 <p align="center">
-  <h1 align="center">🏠 AssistantIA Domotique</h1>
-  <p align="center"><strong>L'antivirus de votre maison — propulsé par Claude AI</strong></p>
-  <p align="center"><em>v7.39 — 11 814 lignes — 51 commandes — 10 skills — 22 tables</em></p>
+  <a href="#-installation-rapide">Installation</a> ·
+  <a href="docs/INSTALL.md">Documentation</a> ·
+  <a href="docs/TROUBLESHOOTING.md">Dépannage</a> ·
+  <a href="docs/BETA_CHANNEL.md">Mode bêta-testeur</a>
+</p>
+
+<p align="center">
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white">
+  <img alt="Home Assistant" src="https://img.shields.io/badge/Home_Assistant-2024.1+-41BDF5?logo=home-assistant&logoColor=white">
+  <img alt="Claude AI" src="https://img.shields.io/badge/Claude_AI-powered-D97757">
+  <img alt="License" src="https://img.shields.io/badge/License-MIT-green">
 </p>
 
 ---
 
-**AssistantIA** est un agent IA autonome qui surveille votre maison 24/7 via Home Assistant. Il apprend vos habitudes, détecte les anomalies, optimise votre consommation, et vous fait économiser de l'argent — chaque jour.
+**AssistantIA** est un agent IA autonome qui surveille votre maison 24/7 via Home Assistant. Il apprend vos habitudes, détecte vos appareils, optimise votre consommation, et vous fait économiser de l'argent — chaque jour.
 
-**Le business model** : chaque euro en tokens produit 10-20€ d'économies. Le script se finance par ses propres résultats.
+> Le script se finance par ses propres résultats : chaque euro en tokens produit 10 à 20 € d'économies.
 
----
+## ✨ Ce qu'il fait
 
-## 🧬 Pourquoi ce script existe
+- **🔍 Détection universelle** : Zigbee, Matter, Z-Wave, WiFi, ESPHome — tout ce qui apparaît dans Home Assistant
+- **⚡ Moteur d'économies proactif** : briefing matin, alertes pic solaire, détection standbys, optimisation HP/HC
+- **🧺 Cycles machines** : détection automatique des lave-linge / sèche-linge / lave-vaisselle + estimation coût
+- **💬 Pilotage naturel** : « Allume la lumière du salon » → Claude appelle le bon service HA
+- **🤖 Auto-correction** : `/probleme <description>` → Claude diagnostique et propose un patch
+- **📊 ROI mesuré en euros** : chaque économie enregistrée, cumul par mois, comparaison mois/mois
 
-> L'utilisateur paie des tokens avec les économies que le script génère.
+## 📋 Pré-requis
 
-Le script surveille tout (Zigbee, Matter, Z-Wave, WiFi), détecte vos appareils, apprend votre profil, et vous pousse des actions chaque jour pour économiser. Avec ou sans panneaux solaires.
+| # | Quoi | Où l'obtenir | Gratuit ? |
+|---|------|--------------|-----------|
+| 1 | **Bot Telegram** | [@BotFather](https://t.me/BotFather) → `/newbot` | ✅ |
+| 2 | **Home Assistant** avec token long-lived | Profil → Tokens longue durée | ✅ |
+| 3 | **Clé API Anthropic** | [console.anthropic.com](https://console.anthropic.com) | ~5-10 €/mois |
+| 4 | **Une machine Linux** (Pi, VM, NAS, HA Add-on...) | Voir tableau ci-dessous | Variable |
 
-**Ce qu'il fait chaque jour automatiquement :**
+## 🚀 Installation rapide
 
-| Heure | Ce qui se passe |
-|-------|-----------------|
-| **7h00** | Briefing matin : bilan hier + conseil du jour (HC/solaire/standby) |
-| **En continu** | Surveillance 51 commandes, 22 tables, 11 threads |
-| **Pic solaire** | "2700W dispo ! Lancez une machine → 0.32€ gratuit" |
-| **Standby oublié** | "TV en veille 12W → 1.8€/mois. Coupez ou dites à Google" |
-| **Machine lancée** | "🧺 Lave-linge en marche — estimation 0.18€ (solaire 45%)" |
-| **Machine finie** | "🧺 Terminé — 1.23 kWh — 0.18€. Hublot déverrouillé." |
-| **Sèche-linge** | "👕 Linge chaud ! Sortez-le — plus facile à plier." |
-| **21h00** | Bilan du soir : total du jour par source + cumul mois |
+Quatre méthodes supportées. **Choisissez celle qui correspond à votre matériel** :
 
-### Il s'adapte à VOTRE maison
+### 1️⃣ HA Add-on — Le plus simple (HA OS / Supervised)
 
-Au premier lancement, le script pose des questions :
+Si vous avez Home Assistant OS (HA Green, Yellow, Blue, etc.) :
 
-**Profil foyer** (8 questions) : combien de personnes, présence, solaire, chauffage, eau chaude, assistant vocal, objectif.
+1. Dans Home Assistant : **Paramètres → Modules complémentaires → Boutique → ⋮ → Dépôts**
+2. Ajoutez : `https://github.com/shaine93/assistant-domotique-home-assistant-Claude-IA`
+3. Trouvez **AssistantIA Domotique** dans la liste, cliquez **Installer**
+4. Configurez : `telegram_token` + `anthropic_api_key` (l'URL HA et le token sont automatiques)
+5. **Démarrez**
 
-**Appareils sur prises** (1 question par prise) : lave-linge, sèche-linge, lave-vaisselle, congélateur, coupe-veille (TV/PC), monitoring énergie, ou ignorer.
+[📖 Guide détaillé →](docs/INSTALL.md#ha-add-on)
 
-Ensuite il adapte tout : avec solaire → alertes pic solaire. Sans solaire → conseils HP/HC. Avec Google Nest → commandes vocales dans les alertes.
+### 2️⃣ Docker Compose — Le plus portable
 
-### Claude AI = votre développeur
+Sur n'importe quelle machine avec Docker (NAS Synology, Mini PC, Linux...) :
 
-```
-/probleme Je veux une alerte quand le congélateur dépasse 100W
-```
-
-Claude Sonnet lit les 11 814 lignes, propose un patch, vous appuyez ✅. Pas de code, pas de terminal.
-
----
-
-## 🚀 Déploiement
-
-### Ce qu'il faut préparer (10 min)
-
-| # | Quoi | Où |
-|---|------|----|
-| 1 | **Bot Telegram** | `@BotFather` → `/newbot` → token |
-| 2 | **Token HA** | Profil → Tokens longue durée |
-| 3 | **URL HA** | `http://192.168.1.XX:8123` |
-| 4 | **Clé Anthropic** | `console.anthropic.com` (~5-10€/mois) |
-
-### Sur quel matériel ?
-
-| Machine | Coût | Idéal pour |
-|---------|------|------------|
-| **HA Add-on** | 0€ | Déjà sur HA OS → 1 clic |
-| **Raspberry Pi 4/5** | 40-80€ | Dédié, 5W |
-| **VM Cloud gratuite** | 0€ | Oracle/Google free tier |
-| **NAS Synology** | 0€ | Docker, déjà allumé |
-
-### Installation
-
-**HA Add-on (2 min)** : Paramètres → Add-ons → Dépôts → URL GitHub → Installer → Config → Démarrer
-
-**Script (5 min)** :
 ```bash
-git clone https://github.com/votre-repo/assistantia-domotique.git
-cd assistantia-domotique && pip install anthropic requests
-python3 assistant.py
+git clone https://github.com/shaine93/assistant-domotique-home-assistant-Claude-IA.git
+cd assistant-domotique-home-assistant-Claude-IA
+cp env.example .env     # puis éditez .env avec vos credentials
+docker compose up -d
+docker compose logs -f  # suivez les logs
 ```
 
-**Docker** :
+[📖 Guide détaillé →](docs/INSTALL.md#docker)
+
+### 3️⃣ Linux natif (Raspberry Pi, VM, serveur)
+
+Pour un contrôle total, avec systemd pour l'auto-recovery :
+
 ```bash
-docker run -d --name assistantia --restart unless-stopped \
-  -v assistantia_data:/app/data -p 8501:8501 \
-  ghcr.io/votre-repo/assistantia-domotique:latest
+git clone https://github.com/shaine93/assistant-domotique-home-assistant-Claude-IA.git
+cd assistant-domotique-home-assistant-Claude-IA
+./install.sh                       # wizard CLI interactif
+sudo ./scripts/install_systemd.sh  # déploie comme service système
 ```
 
-Le wizard Telegram guide tout le reste. **15 minutes. Ensuite vous ne touchez plus rien.**
+Le service `assistantia.service` démarre au boot, se relance en cas de crash (`Restart=always`).
 
----
+[📖 Guide détaillé →](docs/INSTALL.md#linux-natif)
 
-## 🤝 Mise en service — Claude Opus 4.6
+### 4️⃣ Installation manuelle — Pour comprendre ce qui se passe
 
-Le déploiement assisté se fait via **Claude Opus 4.6 étendu**. Collez le Cahier des Charges + votre matériel. Opus gère tout.
+```bash
+git clone https://github.com/shaine93/assistant-domotique-home-assistant-Claude-IA.git
+cd assistant-domotique-home-assistant-Claude-IA
+pip install -r requirements.txt
+./install.sh                # génère config.json
+python3 assistant.py        # lance le bot
+```
 
----
+[📖 Guide détaillé →](docs/INSTALL.md#manuel)
 
-## 🔌 Détection universelle
+## 🎯 Après l'installation
 
-Le script détecte **tout** ce qui apparaît dans Home Assistant — Zigbee, Matter, Z-Wave, WiFi, ESPHome, IP. Chaque nouvelle entité est notifiée avec le protocole détecté et les faits HA. Pas de supposition.
+1. **Envoyez un message** à votre bot Telegram (n'importe quoi)
+   → votre `chat_id` se détecte automatiquement
+2. Le bot vous guide : **questionnaire appareils**, **profil foyer**, **tarif électricité**
+3. Tapez `/aide` pour voir toutes les commandes disponibles
 
-Les prises avec mesure de puissance déclenchent automatiquement le questionnaire : "C'est quoi sur cette prise ?"
+⏱ **Temps total** : 10 minutes. Ensuite vous ne touchez plus rien.
+
+## 🏗 Sur quel matériel ?
+
+| Machine | RAM min | Coût | Idéal pour |
+|---|---|---|---|
+| **HA Add-on** (sur HA OS) | 512 MB | 0 € | Vous avez déjà HA Green/Yellow → 1 clic |
+| **Raspberry Pi 4/5** | 2 GB | 40-80 € | Dédié, silencieux, 5 W |
+| **VM Oracle Cloud** (free tier) | 1 GB | 0 € | Gratuit permanent, ARM |
+| **VM Google Cloud** (e2-micro) | 1 GB | 0 € | Gratuit 12 mois |
+| **Mini PC N100/N95** | 8 GB | 80-150 € | Puissant, SSD fiable |
+| **NAS Synology** (Docker) | 4 GB | 0 € | Déjà allumé 24/7 |
 
 ## 💰 Combien ça rapporte ?
 
 | Poste | Montant |
-|-------|---------|
-| Script | **Gratuit** (MIT) |
-| Tokens Claude | ~5-10€/mois (diminue avec le temps) |
-| Économies typiques | **40-80€/an** |
-| **ROI** | **x10 à x20** |
+|---|---|
+| Script (MIT) | **Gratuit** |
+| Tokens Claude | ~5-10 €/mois (diminue avec le temps) |
+| Économies typiques | **40-80 €/an** |
+| **ROI** | **×10 à ×20** |
 
-> Le mois 6 coûte moins que le mois 1. L'expertise est locale, les tokens diminuent, les économies augmentent.
+> Le mois 6 coûte moins que le mois 1 : l'expertise est locale, les tokens diminuent, les économies augmentent.
 
-## 🗺️ Roadmap — tout est fait
+## 📚 Documentation
+
+- [docs/INSTALL.md](docs/INSTALL.md) — Guide d'installation détaillé (4 méthodes)
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — Toutes les clés de `config.json`
+- [docs/COMMANDS.md](docs/COMMANDS.md) — Les 51 commandes Telegram
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — Résolution des problèmes courants
+- [docs/BETA_CHANNEL.md](docs/BETA_CHANNEL.md) — Mode bêta-testeur (patches à distance, **opt-in**)
+- [Cahier_des_Charges.md](Cahier_des_Charges.md) — Spécifications complètes
+
+## 🛡 Sécurité
+
+- `config.json` contient vos secrets : l'installateur lui met automatiquement les droits `600` (lecture propriétaire seul)
+- Canal Telegram verrouillé au démarrage avec un code à 6 chiffres (SMS / notif HA / email)
+- Toutes les actions HA sensibles (serrure, lumière, climat) passent par un bouton de confirmation ✅/❌
+- Mode bêta-testeur **désactivé par défaut** — active le deploy_server uniquement si vous l'activez explicitement. Voir [BETA_CHANNEL.md](docs/BETA_CHANNEL.md) pour les implications.
+
+## 🗺 Roadmap
 
 - [x] 51 commandes Telegram + langage naturel
-- [x] 25 rôles universels (0 entity_id en dur)
-- [x] Mode sniper : polling 20s/60s adaptatif
-- [x] Profil foyer (8 questions → skills)
-- [x] 3 catégories appareils (cycles / coupe-veille / monitoring)
+- [x] Détection universelle (Matter / Zigbee / Z-Wave / WiFi)
 - [x] Moteur économies proactif (briefing 7h, pic solaire, standby, HP/HC, bilan 21h)
-- [x] Détection universelle (Matter, Zigbee, Z-Wave, WiFi)
-- [x] Mesures SQLite temps réel (survit aux restarts)
-- [x] Grâce intelligente par machine + rappels immédiats
-- [x] Tarification 6 fournisseurs FR
-- [x] Auto-correction erreurs
+- [x] Auto-correction via `/probleme`
+- [x] Intégration Google Home / Alexa (TTS)
 - [x] HA Add-on + Docker + systemd
-- [x] Tests pytest + i18n FR/EN
-- [x] Multi-utilisateur + calendrier HA + dashboard Lovelace
+- [ ] Ballon thermodynamique (pince ampèremétrique)
+- [ ] Dashboard web (FastAPI)
+- [ ] App mobile (React Native)
 
-**v2.0 — En cours :**
-- [ ] **Repo GitHub public** + README vitrine + screenshots Telegram
-- [ ] **10 bêta testeurs** (forum HA Community, Reddit, Discord)
-- [ ] Bilan hebdo automatique (dimanche 20h, arrive tout seul)
-- [ ] Graphiques Telegram (courbes conso/solaire en image)
-- [ ] Briefing matin complet (météo + calendrier + solaire + poubelles)
-- [ ] Comparaison mois/mois ("ce mois -18% vs le mois dernier")
-- [ ] Auto-guérison testée bout en bout + rollback automatique
+## 🤝 Contribuer
 
-## 📜 License
+- 🐛 **Bug** → [GitHub Issues](https://github.com/shaine93/assistant-domotique-home-assistant-Claude-IA/issues)
+- 💡 **Idée** → [GitHub Discussions](https://github.com/shaine93/assistant-domotique-home-assistant-Claude-IA/discussions)
+- 🧪 **Bêta testeur** → [Forum HACF](https://forum.hacf.fr/t/assistantia-domotique-lia-qui-gere-votre-maison-pendant-que-vous-dormez/78164)
 
-MIT — Utilisez, modifiez, partagez librement.
+## 📜 Licence
+
+[MIT](LICENSE) — Utilisez, modifiez, partagez librement.
 
 ---
 
