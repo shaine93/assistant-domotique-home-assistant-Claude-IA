@@ -1,9 +1,10 @@
-# 📋 CAHIER DES CHARGES — AssistantIA Domotique v7.60
-## L'IA qui gère votre maison. Vous ne faites rien.
+# 📋 CAHIER DES CHARGES — AssistantIA Domotique v8.0
+## Un agent IA conversationnel et autonome pour votre Home Assistant.
 
-**Version** : 7.62
-**Date** : 19/04/2026
+**Version** : 8.0
+**Date** : 24/04/2026
 **Script** : 4 fichiers | 22 tables | 11 threads | 18 skills | 51 commandes | 25 rôles
+**Statut public** : v2.0 bêta — repo GitHub propre et installable (24/04/2026)
 
 ---
 
@@ -72,6 +73,124 @@ même si le tunnel n'a pas redémarré.
 - `StartLimitIntervalSec` doit être dans `[Unit]`, pas `[Service]` (systemd ≥ 230)
 - `KillMode=control-group` (pas `mixed`) → garantit que `systemctl stop` tue toute la cgroup
 - `wait $PID` après `cmd &` dans le wrapper, pas `cmd | while read` → un seul niveau de fork
+- **Watchdog (fix 24/04/2026)** : `curl -sf` considérait un 401 (auth refusée) comme un crash → boucle de restart toutes les 2 min. Fix : `is_alive()` accepte 200 ET 401 comme preuves de vie.
+- **config.json ownership (fix 24/04/2026)** : un patch via `sudo python3` a écrit le fichier en root:root → deploy_server (tournant en lolufe) ne pouvait plus lire → PermissionError en boucle. Fix : toujours `chown lolufe:lolufe` + `chmod 600` après modification en root.
+
+### Rotation des secrets (24/04/2026)
+
+Les 4 secrets exposés publiquement sur le repo GitHub avant nettoyage ont été révoqués et régénérés :
+
+| Secret             | Action                                      | Statut                |
+|--------------------|---------------------------------------------|-----------------------|
+| `telegram_token`   | Révoqué via @BotFather `/revoke` + nouveau  | ✅ Bot `@HomeAIoraclebot` |
+| `ha_token`         | Révoqué + nouveau long-lived token          | ✅ 747 entités OK      |
+| `anthropic_api_key`| Révoquée + nouvelle créée                   | ✅ API Messages 200    |
+| `deploy_secret`    | Régénéré (64 chars hex) + services restart  | ✅ HMAC OK             |
+
+**Règle** : le `deploy_secret` ne doit JAMAIS apparaître en clair dans le Cahier des Charges ni dans aucun fichier commit sur Git. Il se lit depuis `config.json` (permissions 600) au démarrage du deploy_server.
+
+### Endpoint `/config_update` (ajouté 21/04/2026)
+
+POST sécurisé pour modifier des clés de `config.json` via le deploy_server :
+- Whitelist stricte des clés modifiables
+- Backup horodaté dans `versions/config.json.bak.YYYYMMDD_HHMMSS`
+- Les valeurs ne sont **jamais** loguées
+- Requiert HMAC-SHA256 comme tout endpoint POST
+
+---
+
+## 📦 v2.0 — REPO PUBLIC PROPRE ET INSTALLABLE (24/04/2026)
+
+### Ce qui a été fait
+
+Le repo public https://github.com/shaine93/assistant-domotique-home-assistant-Claude-IA a été refondu pour être installable par un utilisateur inconnu en quelques minutes.
+
+**Nettoyage sécurité :**
+- 828 fichiers retirés du tracking git (config.json, memory.db, tous les logs, backups/, versions/)
+- Historique complet purgé via `git-filter-repo --invert-paths` → les anciens commits avec secrets ne sont plus accessibles
+- Force-push sur `main` → commit `67feebb Clean: add .gitignore, untrack secrets and logs (secrets rotated)`
+- `.gitignore` créé (41 lignes) qui protège les secrets, logs et données utilisateur
+- Les 4 secrets exposés (telegram, HA, anthropic, deploy_secret) ont été révoqués et régénérés (voir section "Rotation des secrets" plus haut)
+
+**Fichiers d'install v2.0 ajoutés :**
+
+| Fichier                           | Rôle                                            |
+|-----------------------------------|-------------------------------------------------|
+| `README.md`                       | Vitrine sans promesse ROI ×10-×20 (repositionné) |
+| `install.sh`                      | Wizard CLI interactif (--from-env ou interactif) |
+| `requirements.txt`                | Dépendances Python (anthropic, requests, matplotlib) |
+| `env.example`                     | Template `.env` sans secrets                    |
+| `Dockerfile` + `docker-compose.yml` | Déploiement Docker (build local ou ghcr.io)   |
+| `assistantia.service.template`    | Unit systemd paramétrable (plus de hardcode pi) |
+| `scripts/install_systemd.sh`      | Déploie le service systemd Linux natif          |
+| `scripts/enable_beta_channel.sh`  | Active le deploy_server + tunnel (opt-in)       |
+| `scripts/disable_beta_channel.sh` | Désactive le canal bêta                         |
+| `docs/INSTALL.md`                 | Guide détaillé par méthode                      |
+| `docs/CONFIGURATION.md`           | Toutes les clés de config.json                  |
+| `docs/TROUBLESHOOTING.md`         | Résolution des problèmes courants               |
+| `docs/BETA_CHANNEL.md`            | Mode bêta-testeur (implications sécurité)       |
+| `addon/Dockerfile`                | HA Add-on (renommé depuis .txt)                 |
+| `addon/config.yaml`               | URL GitHub réelle + flag `enable_deploy_server` |
+| `addon/run.sh`                    | Runtime HA Add-on (persistance + opt-in deploy) |
+| `LICENSE`                         | MIT                                             |
+
+**Supprimés :**
+- `addon/Dockerfile.txt` (extension incorrecte, rejetée par HA Add-on Store)
+- `assistantia.service.txt` (remplacé par `.template` + script d'install)
+
+### 4 méthodes d'installation supportées
+
+1. **HA Add-on** — 1 clic dans Home Assistant OS
+2. **Docker Compose** — `docker compose up -d` avec `.env`
+3. **Linux natif** — `./install.sh` + `sudo ./scripts/install_systemd.sh`
+4. **Manuel** — `pip install -r requirements.txt` + `python3 assistant.py`
+
+### Mode bêta-testeur — opt-in strict
+
+Le `deploy_server` et son tunnel Cloudflare sont **désactivés par défaut** dans toutes les méthodes d'install. L'utilisateur doit explicitement lancer `./scripts/enable_beta_channel.sh` pour activer le canal de patches à distance, après avoir lu `docs/BETA_CHANNEL.md` qui documente :
+- Ce que le mainteneur peut faire (lire le code, pousser un patch, restart)
+- Ce qu'il ne peut PAS faire (lire config.json, exécuter du shell arbitraire)
+- Comment désactiver à tout moment
+
+### Validation end-to-end
+
+Test simulé d'un nouvel utilisateur (depuis la VM, dans `/tmp/e2e-test-install`) :
+- `git clone` ✅
+- 19 fichiers d'install présents ✅
+- 7 fichiers sensibles absents (config.json, memory.db, logs, .txt obsolètes) ✅
+- 5 scripts exécutables (`chmod 755`) ✅
+- `bash install.sh --non-interactive --from-env` → `config.json` généré avec les 17 bonnes clés, permissions 600 ✅
+- 12/12 vérifications sémantiques sur `config.json` ✅
+- 5/5 scripts shell sans erreur de syntaxe ✅
+
+Résultat : **un visiteur qui arrive sur le repo peut cloner et lancer le bot en moins de 10 min.**
+
+### Repositionnement du README (retrait des promesses non tenables)
+
+Suite aux 6 retours du forum HACF (05/04/2026) qui rejetaient la promesse ROI ×10-×20 comme non crédible :
+
+**Retiré :**
+- « Chaque euro en tokens produit 10 à 20 € d'économies »
+- « ROI ×10 à ×20 » dans le tableau
+- « Économies typiques 40-80 €/an »
+- « Chaque jour, il vous fait gagner de l'argent »
+
+**Ajouté :**
+- Section « En quoi c'est différent d'une automation classique ? » (réponse à Tochy)
+- Mention Groq/Ollama sur la roadmap (réponse à kellogs/faiseurdepluie)
+- Section « Combien ça coûte vraiment ? » honnête (réponse à bastgau/ebz)
+- Badge `status: beta` + section « État du projet » qui assume le statut
+
+**Positionnement final :** agent IA conversationnel pour HA, pas machine à économies. Le script mesure toujours ses économies via `/roi` — à l'utilisateur de juger.
+
+### Commits publics v2.0
+
+```
+153dbf7 README v2: retrait des promesses de ROI non tenables
+e66a8d0 Fix: install.sh utilise $'...' pour les couleurs ANSI
+0a6d8ef Install v2.0: proper README, 4 install methods, docs/, scripts/, LICENSE
+67feebb Clean: add .gitignore, untrack secrets and logs (secrets rotated)
+```
 
 ---
 
@@ -110,7 +229,8 @@ python3 -c "
 import json, urllib.request
 resp = urllib.request.urlopen(urllib.request.Request('https://ntfy.sh/assistantia-deploy-8501-secret/json?poll=1&since=24h'), timeout=10)
 BASE = json.loads(resp.read().decode().strip().split(chr(10))[-1]).get('message','')
-SECRET = '45605531a18b27dca47cc640701f8c7c6571cdba33b0876b152e1e31be161ec4'
+# SECRET : à récupérer via SSH avec : sudo cat /home/lolufe/assistant/config.json | python3 -c "import json,sys; print(json.load(sys.stdin)['deploy_secret'])"
+SECRET = 'METTRE_ICI_LE_DEPLOY_SECRET_LU_DEPUIS_CONFIG_JSON'
 req = urllib.request.Request(f'{BASE}/read/Cahier_des_Charges.md')
 req.add_header('Authorization', f'Bearer {SECRET}')
 data = json.loads(urllib.request.urlopen(req, timeout=15).read().decode())
@@ -122,7 +242,7 @@ python3 -c "
 import json, urllib.request
 resp = urllib.request.urlopen(urllib.request.Request('https://ntfy.sh/assistantia-deploy-8501-secret/json?poll=1&since=24h'), timeout=10)
 BASE = json.loads(resp.read().decode().strip().split(chr(10))[-1]).get('message','')
-SECRET = '45605531a18b27dca47cc640701f8c7c6571cdba33b0876b152e1e31be161ec4'
+SECRET = 'METTRE_ICI_LE_DEPLOY_SECRET_LU_DEPUIS_CONFIG_JSON'
 req = urllib.request.Request(f'{BASE}/status')
 req.add_header('Authorization', f'Bearer {SECRET}')
 print(json.loads(urllib.request.urlopen(req, timeout=10).read().decode()))
@@ -133,7 +253,7 @@ python3 -c "
 import json, urllib.request
 resp = urllib.request.urlopen(urllib.request.Request('https://ntfy.sh/assistantia-deploy-8501-secret/json?poll=1&since=24h'), timeout=10)
 BASE = json.loads(resp.read().decode().strip().split(chr(10))[-1]).get('message','')
-SECRET = '45605531a18b27dca47cc640701f8c7c6571cdba33b0876b152e1e31be161ec4'
+SECRET = 'METTRE_ICI_LE_DEPLOY_SECRET_LU_DEPUIS_CONFIG_JSON'
 req = urllib.request.Request(f'{BASE}/logs?n=30')
 req.add_header('Authorization', f'Bearer {SECRET}')
 for line in json.loads(urllib.request.urlopen(req, timeout=10).read().decode())['lines']:
@@ -145,7 +265,7 @@ INFRASTRUCTURE :
 - Tunnel Cloudflare : URL dynamique publiée sur ntfy.sh/assistantia-deploy-8501-secret
 - Script : 4 fichiers (config.py / shared.py / skills.py / assistant.py)
 - Deploy Server : port 8501 (localhost), HMAC-SHA256, accès via tunnel uniquement
-- Deploy secret : 45605531a18b27dca47cc640701f8c7c6571cdba33b0876b152e1e31be161ec4
+- Deploy secret : dans config.json (permissions 600, JAMAIS en clair dans ce doc)
 - DB : /home/lolufe/assistant/memory.db
 - MD : /home/lolufe/assistant/Cahier_des_Charges.md
 
