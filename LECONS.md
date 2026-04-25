@@ -70,6 +70,40 @@ Ce fichier est enrichi par les bêta testeurs. Chaque piège découvert évite d
 - **Symptôme** : nouvel appareil avec LQI 30-40, performances dégradées
 - **Cause** : table de routage pas encore optimisée
 - **Fix** : attendre 24h, ou forcer un "Rediscover Network" dans Z2M + changer de canal WiFi si interférence
+### Device offline non détecté — bug critique (24/04/2026)
+
+- **Symptôme** : une prise Zigbee débranchée (`switch.prise_ecojoko`) reste 6h24 hors ligne (passage `unavailable` à 09:53:43, retour à 16:17:39) sans qu'aucune alerte Telegram ne soit envoyée
+- **3 causes racines cumulées** identifiées par diagnostic forensique post-incident :
+
+**Cause 1 — `_surveiller_zigbee` cassée silencieusement**
+
+La fonction filtre les devices physiques via l'attribut `linkquality` (L3915 de `skills.py`) :
+```python
+lqi = e.get("attributes", {}).get("linkquality")
+if lqi is None:
+    continue
+```
+Or, sur cette installation HA (Z2M via MQTT, intégration HA standard), **aucune entité ne remonte cet attribut** dans `/api/states`. Vérification : `linkquality` introuvable dans le top 30 des attributs. Conséquence : la fonction n'a **jamais surveillé aucun device** depuis sa création.
+
+**Cause 2 — Table `zigbee_absences` polluée par des entrées orphelines**
+
+La table `zigbee_absences` contient une entrée pour `switch.prise_ecojoko` datée du 7 mars 2026, statut `en_attente`, avec un `retour_en_ligne` rempli quelques minutes plus tard. Cette entrée n'a jamais été nettoyée. Lors d'une nouvelle disparition, le code `_surveiller_zigbee` interroge `zigbee_absence_get(eid)` et trouve l'ancienne entrée → considère que c'est déjà signalé → ne lève pas de nouvelle alerte. Bug de logique : il faut vérifier si l'entrée correspond à la **session actuelle** d'absence, pas à une ancienne.
+
+**Cause 3 — `_alerte_zigbee_device_mort` trop conservatrice**
+
+La fonction filet de sécurité ne tournait qu'**une fois par jour à 9h00-9h05** avec un seuil **24h** d'absence. Le passage en `unavailable` à 09:53:43 n'a pas pu déclencher d'alerte avant le lendemain matin, et la prise a été rebranchée avant.
+
+- **Tentatives de patch (24-25/04/2026)** :
+  - **v1** : élargir le seuil à 1h, fréquence 15 min, périmètre `cartographie`. Problème : 150 entités unavailable normales (sous-entités logiques `_silent_mode`, `_identify`, services TTS, automations conditionnelles…) auraient déclenché 150 alertes Telegram.
+  - **v2** : ajout des filtres `EXCLUSIONS_ZIGBEE` + `linkquality`. Problème : `linkquality` étant cassé sur cette install (cause 1), aucune alerte ne tirait jamais.
+  - **Décision** : **rollback complet**. Le bug demande une refonte de `_surveiller_zigbee` qui ne dépende pas de `linkquality`, doublé d'un nettoyage de `zigbee_absences`. Pas un fix d'urgence.
+
+- **Fix à concevoir proprement** (jamais déployé) :
+  1. Source de vérité unique : durée depuis `last_changed` lorsque `state == "unavailable"` (universel, pas dépendant d'attributs spécifiques HA)
+  2. Périmètre : entités de la cartographie ciblées par catégorie (ex: `prise_connectee/commande` uniquement, pas `_option_*` ou `_silent_mode`)
+  3. Cooldown par device (clé `zigbee_mort_<eid>`), pas global
+  4. Reset de `zigbee_absences` quand un device est en ligne stable depuis > 1h (purge des entrées dont `retour_en_ligne` est rempli depuis plus d'une heure)
+  5. Tester avec un débranchement volontaire avant de pousser en prod
 
 ---
 
