@@ -3650,15 +3650,15 @@ def surveillance_monitoring():
             except Exception:
                 pass
 
-            # Zigbee device mort (1x/jour 9h)
+            # Heartbeat pilier — skill apprenant (5 min)
             try:
-                _alerte_zigbee_device_mort(index, now)
+                _heartbeat_observe(index, now)
             except Exception:
                 pass
 
-            # Ecojoko pilier — surveillance critique du cœur du système (5 min)
+            # Zigbee device mort (1x/jour 9h)
             try:
-                _alerte_ecojoko_pilier(index, now)
+                _alerte_zigbee_device_mort(index, now)
             except Exception:
                 pass
 
@@ -10729,137 +10729,374 @@ def _detecter_coupure_internet(now):
         log.debug(f"Coupure internet: {e}")
 
 
-def _alerte_ecojoko_pilier(index, now):
-    """Surveille Ecojoko comme le pilier vital du système.
-    
-    Ecojoko est la source de vérité pour conso réseau, production solaire, et
-    calcul des économies. S'il se fige, les préconisations de Claude deviennent
-    fausses sans qu'on le sache. Cette fonction garantit qu'une dérive est détectée.
-    
-    Surveillance toutes les 5 minutes :
-    - 6 sensors énergétiques + environnementaux figés > 30 min → alerte
-    - Sensor en `unavailable` ou `unknown` > 30 min → alerte critique
-    - HC/HP_reseau en `unknown` > 8h (raté rollover minuit) → alerte distincte
-    - Cooldown : 1 alerte initiale + re-alerte toutes les 6h si non résolu
-    
-    Utilise `last_updated` (et non `last_changed`) comme marqueur de vie :
-    last_updated bouge à chaque ping reçu du boîtier, même si la valeur est
-    identique. C'est le bon marqueur pour détecter "boîtier qui répond plus".
-    
-    CRASH-PROOF : toute exception est avalée pour ne pas casser la boucle.
-    
-    Ajouté 25/04/2026 — Ecojoko est le pilier, sa surveillance est critique.
-    """
-    SENSORS_VITAUX = [
-        # 3 sensors énergétiques (issus de la pince électrique)
-        "sensor.ecojoko_consommation_temps_reel",
-        "sensor.ecojoko_consommation_reseau",
-        "sensor.ecojoko_surplus_de_production",
-        # 1 sensor environnemental (sonde indépendante = heartbeat boîtier)
-        # Permet de distinguer "panne pince" vs "boîtier mort"
-        "sensor.ecojoko_humidite_interieure",
-    ]
-    # Sensors retirés intentionnellement :
-    # - sensor.ecojoko (version logicielle, ne change jamais → faux positif)
-    # - sensor.ecojoko_temperature_interieure (varie peu → seuil 30min trop court)
-    SENSORS_TARIF = [
-        "sensor.ecojoko_consommation_hc_reseau",
-        "sensor.ecojoko_consommation_hp_reseau",
-    ]
-    SEUIL_FIGE_MIN = 30
-    SEUIL_TARIF_HEURES = 8
-    COOLDOWN_HEURES = 6
-
+def _heartbeat_init_table():
+    """Crée la table sensor_heartbeat si elle n'existe pas. Idempotent."""
     try:
-        # Garde de fréquence : check toutes les 5 minutes (pas chaque cycle de 2s)
-        derniere_check = mem_get("ecojoko_pilier_check")
-        if derniere_check:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sensor_heartbeat (
+                entity_id TEXT PRIMARY KEY,
+                median_sec INTEGER,
+                p95_sec INTEGER,
+                p99_sec INTEGER,
+                samples_count INTEGER,
+                last_recompute TEXT,
+                learning_started TEXT,
+                learning_complete INTEGER DEFAULT 0
+            )
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.debug(f"heartbeat_init_table: {e}")
+
+
+# Liste des sensors piliers énergétiques.
+# Validée 25/04/2026 avec Philippe : 8 sensors actifs + 2 sensors HC/HP traités à part.
+_HEARTBEAT_SENSORS_PILIERS = [
+    "sensor.ecojoko_consommation_temps_reel",
+    "sensor.ecojoko_consommation_reseau",
+    "sensor.ecojoko_surplus_de_production",
+    "sensor.ecojoko_humidite_interieure",
+    "sensor.ecu_current_power",
+    "sensor.ecu_today_energy",
+    "sensor.solarbank_e1600_puissance_solaire",
+    "sensor.solarbank_e1600_etat_de_charge",
+]
+# HC/HP : 1 update/jour à minuit, traités à part avec seuil 26h
+_HEARTBEAT_SENSORS_TARIF = [
+    "sensor.ecojoko_consommation_hc_reseau",
+    "sensor.ecojoko_consommation_hp_reseau",
+]
+
+
+def _heartbeat_apprendre(entity_id):
+    """Apprend la baseline d'un sensor depuis l'historique HA des 7 derniers jours.
+    
+    Returns: (median_sec, p95_sec, p99_sec, samples_count) ou None si pas assez de données.
+    """
+    try:
+        from datetime import datetime, timedelta, timezone
+        cfg = load_config()
+        ha_url = cfg.get("ha_url")
+        ha_token = cfg.get("ha_token")
+        if not ha_url or not ha_token:
+            return None
+        
+        start = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        url = f"{ha_url}/api/history/period/{start}?filter_entity_id={entity_id}&minimal_response&no_attributes"
+        
+        r = requests.get(url, 
+                         headers={"Authorization": f"Bearer {ha_token}"},
+                         timeout=30, verify=False)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not data or not data[0] or len(data[0]) < 10:
+            return None
+        history = data[0]
+        
+        # Calcul des écarts entre updates successifs
+        tss = []
+        for entry in history:
+            ts = entry.get("last_changed", entry.get("last_updated", ""))
             try:
-                if (now - datetime.fromisoformat(derniere_check)).total_seconds() < 300:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                tss.append(dt)
+            except Exception:
+                continue
+        
+        if len(tss) < 10:
+            return None
+        
+        gaps = sorted([(tss[i+1] - tss[i]).total_seconds() for i in range(len(tss)-1)])
+        n = len(gaps)
+        median = int(gaps[n // 2])
+        p95 = int(gaps[int(n * 0.95)]) if n >= 20 else int(gaps[-1])
+        p99 = int(gaps[int(n * 0.99)]) if n >= 100 else int(gaps[-1])
+        
+        return (median, p95, p99, len(history))
+    except Exception as e:
+        log.debug(f"heartbeat_apprendre {entity_id}: {e}")
+        return None
+
+
+def _heartbeat_observe(index, now):
+    """Skill heartbeat_pilier : surveille la fraîcheur de mise à jour des sensors énergétiques.
+    
+    3 phases automatiques :
+      1. Apprentissage (J0 à J7) : observation silencieuse, pas d'alertes
+      2. Calibration (J7) : calcul des seuils depuis l'historique HA des 7 derniers jours
+      3. Surveillance (J7+) : alertes si gap > P99 × 2 (warning) ou × 5 (critique)
+    
+    Recompute hebdomadaire pour s'adapter aux saisons.
+    
+    Périmètre : 8 sensors énergétiques piliers (Ecojoko + APSystems + Anker)
+    
+    Fréquence : check toutes les 5 minutes (garde via memoire 'heartbeat_check')
+    Cooldown alertes : 6h (warning), 1h (critique)
+    
+    CRASH-PROOF.
+    
+    Ajouté 25/04/2026 — skill apprenant validé avec Philippe.
+    """
+    from datetime import datetime, timedelta, timezone
+    try:
+        # Garde de fréquence : check toutes les 5 min
+        derniere = mem_get("heartbeat_check")
+        if derniere:
+            try:
+                if (now - datetime.fromisoformat(derniere)).total_seconds() < 300:
                     return
             except Exception:
                 pass
-
-        problemes = []
-
-        # ── 1. Sensors vitaux : figés > 30 min OU unavailable/unknown > 30 min ──
-        for eid in SENSORS_VITAUX:
-            e = index.get(eid)
-            if not e:
-                problemes.append((eid, "ABSENT", "n'existe pas dans HA"))
+        
+        # S'assurer que la table existe
+        _heartbeat_init_table()
+        
+        conn = sqlite3.connect(DB_PATH)
+        
+        for entity_id in _HEARTBEAT_SENSORS_PILIERS:
+            # Lire l'état actuel du sensor depuis l'index
+            e = index.get(entity_id)
+            
+            # Lire la baseline existante
+            row = conn.execute(
+                "SELECT median_sec, p95_sec, p99_sec, samples_count, last_recompute, "
+                "learning_started, learning_complete FROM sensor_heartbeat WHERE entity_id=?",
+                (entity_id,)
+            ).fetchone()
+            
+            if not row:
+                # 1ère fois qu'on voit ce sensor : démarrer l'apprentissage
+                conn.execute(
+                    "INSERT INTO sensor_heartbeat (entity_id, learning_started, learning_complete) "
+                    "VALUES (?, ?, 0)",
+                    (entity_id, now.isoformat())
+                )
+                conn.commit()
                 continue
-
-            state = e.get("state", "")
+            
+            median_sec, p95_sec, p99_sec, samples, last_recompute, learning_started, learning_complete = row
+            
+            # Phase 1 : apprentissage en cours ?
+            if not learning_complete:
+                try:
+                    started = datetime.fromisoformat(learning_started)
+                    days_learning = (now - started).total_seconds() / 86400
+                except Exception:
+                    days_learning = 0
+                
+                if days_learning < 7:
+                    # Encore en apprentissage, on continue en silence
+                    continue
+                
+                # Phase 2 : 7 jours écoulés, calibrer les seuils
+                result = _heartbeat_apprendre(entity_id)
+                if not result:
+                    continue
+                median_sec, p95_sec, p99_sec, samples = result
+                conn.execute(
+                    "UPDATE sensor_heartbeat SET median_sec=?, p95_sec=?, p99_sec=?, "
+                    "samples_count=?, last_recompute=?, learning_complete=1 WHERE entity_id=?",
+                    (median_sec, p95_sec, p99_sec, samples, now.isoformat(), entity_id)
+                )
+                conn.commit()
+                log.info(f"💓 heartbeat: {entity_id} appris (médiane {median_sec}s, P99 {p99_sec}s, {samples} samples)")
+                continue
+            
+            # Phase 3 : surveillance active
+            # Recompute hebdomadaire ?
+            try:
+                last_rc = datetime.fromisoformat(last_recompute)
+                if (now - last_rc).total_seconds() > 7 * 86400:
+                    result = _heartbeat_apprendre(entity_id)
+                    if result:
+                        median_sec, p95_sec, p99_sec, samples = result
+                        conn.execute(
+                            "UPDATE sensor_heartbeat SET median_sec=?, p95_sec=?, p99_sec=?, "
+                            "samples_count=?, last_recompute=? WHERE entity_id=?",
+                            (median_sec, p95_sec, p99_sec, samples, now.isoformat(), entity_id)
+                        )
+                        conn.commit()
+                        log.info(f"💓 heartbeat: {entity_id} recalibré (médiane {median_sec}s, P99 {p99_sec}s)")
+            except Exception:
+                pass
+            
+            # Calculer le gap actuel
+            if not e:
+                # Sensor disparu de HA → alerte critique
+                _alerter_si_nouveau(
+                    f"heartbeat_absent_{entity_id}",
+                    f"🚨 HEARTBEAT — Sensor absent de HA\n━━━━━━━━━━━━━━━━━━\n"
+                    f"  • {entity_id}\n"
+                    f"L'entité n'est plus présente dans Home Assistant.\n"
+                    f"Vérifier l'intégration concernée.",
+                    delai_h=1
+                )
+                continue
+            
             last_updated = e.get("last_updated", "")
             if not last_updated:
                 continue
-
             try:
-                dt_upd = datetime.fromisoformat(last_updated.replace("Z", "+00:00")).replace(tzinfo=None)
-                age_min = (now - dt_upd).total_seconds() / 60
+                dt_upd = datetime.fromisoformat(last_updated.replace("Z", "+00:00"))
+                if dt_upd.tzinfo is None:
+                    dt_upd = dt_upd.replace(tzinfo=timezone.utc)
+                now_utc = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now
+                gap_sec = (now_utc - dt_upd).total_seconds()
             except Exception:
                 continue
-
-            if state in ("unavailable", "unknown") and age_min > SEUIL_FIGE_MIN:
-                problemes.append((eid, "INDISPONIBLE", f"state={state} depuis {age_min:.0f}min"))
-            elif age_min > SEUIL_FIGE_MIN:
-                problemes.append((eid, "FIGÉ", f"pas de ping depuis {age_min:.0f}min (state={state})"))
-
-        # ── 2. Sensors HC/HP : unknown > 8h = rollover minuit raté ──
-        tarif_problemes = []
-        for eid in SENSORS_TARIF:
-            e = index.get(eid)
+            
+            # Seuils dynamiques basés sur la baseline apprise
+            seuil_warning = p99_sec * 2 if p99_sec else 600
+            seuil_critique = p99_sec * 5 if p99_sec else 1800
+            
+            if gap_sec > seuil_critique:
+                _alerter_si_nouveau(
+                    f"heartbeat_critique_{entity_id}",
+                    f"🚨 HEARTBEAT CRITIQUE\n━━━━━━━━━━━━━━━━━━\n"
+                    f"  • {entity_id}\n"
+                    f"  • Gap : {int(gap_sec/60)}min (normal: médiane {int(median_sec/60) if median_sec else 0}min, P99 {int(p99_sec/60) if p99_sec else 0}min)\n"
+                    f"  • State: {e.get('state', '?')}\n\n"
+                    f"Probable panne : intégration HA HS, équipement débranché, ou cloud du fabricant down.",
+                    delai_h=1
+                )
+            elif gap_sec > seuil_warning:
+                _alerter_si_nouveau(
+                    f"heartbeat_warning_{entity_id}",
+                    f"⚠️ HEARTBEAT — Sensor figé\n━━━━━━━━━━━━━━━━━━\n"
+                    f"  • {entity_id}\n"
+                    f"  • Gap : {int(gap_sec/60)}min (normal: médiane {int(median_sec/60) if median_sec else 0}min, P99 {int(p99_sec/60) if p99_sec else 0}min)\n"
+                    f"  • State: {e.get('state', '?')}\n\n"
+                    f"Surveillance à confirmer : peut être normal selon le contexte.",
+                    delai_h=6
+                )
+        
+        # Sensors HC/HP — traités à part (1 update/jour à minuit)
+        for entity_id in _HEARTBEAT_SENSORS_TARIF:
+            e = index.get(entity_id)
             if not e:
                 continue
-            state = e.get("state", "")
             last_updated = e.get("last_updated", "")
-            if state == "unknown" and last_updated:
-                try:
-                    dt_upd = datetime.fromisoformat(last_updated.replace("Z", "+00:00")).replace(tzinfo=None)
-                    age_h = (now - dt_upd).total_seconds() / 3600
-                    if age_h > SEUIL_TARIF_HEURES:
-                        tarif_problemes.append((eid, age_h))
-                except Exception:
-                    pass
-
-        # ── 3. Construire et envoyer l'alerte ──
-        if problemes:
-            # Détection d'une panne globale (tous les sensors vitaux KO)
-            nb_critiques = sum(1 for _, type_, _ in problemes if type_ in ("INDISPONIBLE", "FIGÉ", "ABSENT"))
-            if nb_critiques >= len(SENSORS_VITAUX):
-                titre = "🚨 ECOJOKO HORS SERVICE — PILIER DOWN"
-                detail = "Tous les sensors vitaux sont en défaut.\nCalculs économies/conso/solaire COMPROMIS."
-            elif nb_critiques >= 4:
-                titre = "🚨 ECOJOKO MAJORITAIREMENT HS"
-                detail = f"{nb_critiques}/{len(SENSORS_VITAUX)} sensors vitaux en défaut."
-            else:
-                titre = "⚠️ ECOJOKO — sensor(s) figé(s)"
-                detail = f"{nb_critiques} sensor(s) vital(aux) en défaut."
-
-            details = "\n".join(f"  • {eid.replace('sensor.ecojoko_','')} : {info}" 
-                                for eid, _, info in problemes)
-            _alerter_si_nouveau(
-                "ecojoko_pilier",
-                f"{titre}\n━━━━━━━━━━━━━━━━━━\n{detail}\n\n{details}\n\n"
-                f"Vérifier : boîtier alimenté, WiFi OK, intégration HA active.",
-                delai_h=COOLDOWN_HEURES
-            )
-
-        # Alerte distincte pour tarif HC/HP (rollover minuit)
-        if tarif_problemes:
-            details = "\n".join(f"  • {eid.replace('sensor.ecojoko_','')} : unknown depuis {age:.1f}h"
-                                for eid, age in tarif_problemes)
-            _alerter_si_nouveau(
-                "ecojoko_tarif_hc_hp",
-                f"⚠️ ECOJOKO — tarif HC/HP non remis à jour\n━━━━━━━━━━━━━━━━━━\n"
-                f"Le rollover minuit n'a pas eu lieu correctement.\nLes calculs HC/HP sont basés sur des "
-                f"valeurs anciennes.\n\n{details}\n\nRedémarrer l'intégration Ecojoko dans HA peut résoudre.",
-                delai_h=COOLDOWN_HEURES
-            )
-
-        mem_set("ecojoko_pilier_check", now.isoformat())
+            if not last_updated:
+                continue
+            try:
+                dt_upd = datetime.fromisoformat(last_updated.replace("Z", "+00:00"))
+                if dt_upd.tzinfo is None:
+                    dt_upd = dt_upd.replace(tzinfo=timezone.utc)
+                now_utc = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now
+                gap_h = (now_utc - dt_upd).total_seconds() / 3600
+                # 26h = 1 jour + 2h de marge après le rollover de minuit
+                if gap_h > 26:
+                    _alerter_si_nouveau(
+                        f"heartbeat_tarif_{entity_id}",
+                        f"⚠️ HEARTBEAT TARIF — Rollover quotidien raté\n━━━━━━━━━━━━━━━━━━\n"
+                        f"  • {entity_id}\n"
+                        f"  • Pas mis à jour depuis {gap_h:.1f}h (attendu: 1 update/jour à minuit)\n\n"
+                        f"Les calculs HP/HC peuvent être basés sur des valeurs périmées.\n"
+                        f"Action : redémarrer l'intégration Ecojoko dans HA.",
+                        delai_h=12
+                    )
+            except Exception:
+                pass
+        
+        conn.close()
+        mem_set("heartbeat_check", now.isoformat())
     except Exception as e:
-        log.debug(f"Ecojoko pilier: {e}")
+        log.debug(f"heartbeat_observe: {e}")
+
+
+def cmd_heartbeat():
+    """Commande /heartbeat : affiche le statut du skill heartbeat_pilier.
+    
+    Affiche pour chaque sensor pilier :
+    - Phase d'apprentissage (J/7) ou seuils calibrés (médiane, P99)
+    - Gap actuel depuis dernière mise à jour
+    - Indicateur visuel selon état (🟢 frais / 🟡 attention / 🔴 alerte)
+    
+    Pour réinitialiser l'apprentissage, voir LECONS.md (commande SQL via SSH).
+    """
+    from datetime import datetime, timezone
+    try:
+        _heartbeat_init_table()
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            "SELECT entity_id, median_sec, p95_sec, p99_sec, samples_count, "
+            "learning_started, learning_complete FROM sensor_heartbeat "
+            "ORDER BY entity_id"
+        ).fetchall()
+        conn.close()
+        
+        # Récupérer les states actuels pour calculer les gaps
+        cfg = load_config()
+        gaps = {}
+        try:
+            r = requests.get(f"{cfg['ha_url']}/api/states",
+                             headers={"Authorization": f"Bearer {cfg['ha_token']}"},
+                             timeout=10, verify=False)
+            states_list = r.json()
+            now_utc = datetime.now(timezone.utc)
+            for s in states_list:
+                upd = s.get('last_updated', '')
+                if upd:
+                    try:
+                        dt = datetime.fromisoformat(upd.replace('Z', '+00:00'))
+                        gaps[s['entity_id']] = int((now_utc - dt).total_seconds() / 60)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        
+        if not rows:
+            return ("💓 HEARTBEAT — Aucun sensor en apprentissage.\n"
+                    "Le skill démarrera au prochain cycle de polling (5 min max).")
+        
+        msg_lines = ["💓 HEARTBEAT — Sensors piliers énergétiques", "━" * 28, ""]
+        for row in rows:
+            eid, med, p95, p99, samples, started, complete = row
+            short = eid.replace("sensor.", "")
+            gap_min = gaps.get(eid)
+            gap_str = f"{gap_min}min" if gap_min is not None else "?"
+            
+            if not complete:
+                try:
+                    days = (datetime.now() - datetime.fromisoformat(started)).total_seconds() / 86400
+                    msg_lines.append(f"📚 {short}")
+                    msg_lines.append(f"   apprentissage J{days:.1f}/J7")
+                except Exception:
+                    msg_lines.append(f"📚 {short} (apprentissage)")
+            else:
+                med_str = f"{med//60}min" if med and med >= 60 else f"{med}s" if med else "?"
+                p99_str = f"{p99//60}min" if p99 and p99 >= 60 else f"{p99}s" if p99 else "?"
+                seuil_warn_min = (p99 * 2 / 60) if p99 else 999
+                seuil_atten_min = (p95 / 60) if p95 else 999
+                if gap_min is not None and gap_min > seuil_warn_min:
+                    icon = "🔴"
+                elif gap_min is not None and gap_min > seuil_atten_min:
+                    icon = "🟡"
+                else:
+                    icon = "🟢"
+                msg_lines.append(f"{icon} {short}")
+                msg_lines.append(f"   méd {med_str} · P99 {p99_str} · gap {gap_str} · {samples} samples")
+        
+        # Sensors tarif HC/HP
+        msg_lines.append("")
+        msg_lines.append("📅 Tarif HC/HP (1 update/jour, seuil 26h)")
+        for eid in _HEARTBEAT_SENSORS_TARIF:
+            short = eid.replace("sensor.", "")
+            gap = gaps.get(eid)
+            if gap is None:
+                gap_str = "?"
+                icon = "⚪"
+            else:
+                gap_str = f"{gap//60}h{gap%60:02d}min" if gap > 60 else f"{gap}min"
+                icon = "🔴" if gap/60 > 26 else "🟢"
+            msg_lines.append(f"{icon} {short} · gap {gap_str}")
+        
+        return "\n".join(msg_lines)
+    except Exception as e:
+        return f"❌ /heartbeat : erreur {e}"
 
 
 def _alerte_zigbee_device_mort(index, now):
@@ -11270,6 +11507,7 @@ def traiter_message(texte):
         "automatisations": cmd_automatisations, "automations": cmd_automatisations,
         "addons": cmd_addons,
         "budget": cmd_budget,
+        "heartbeat": cmd_heartbeat,
         "debug": cmd_debug,
         "logs": cmd_logs,
         "mémoire": cmd_memoire, "memoire": cmd_memoire,
