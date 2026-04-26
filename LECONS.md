@@ -114,3 +114,28 @@ Ajoutez vos pièges via GitHub Issue "Leçon fondatrice" avec :
 2. Le symptôme observé
 3. La cause identifiée
 4. Le fix appliqué (ou souhaité)
+
+### Skill heartbeat_pilier — surveillance apprenante des sensors énergétiques (25/04/2026)
+
+- **Contexte** : la leçon précédente identifiait 3 systèmes cassés pour la détection offline. Le skill `heartbeat_pilier` est la première brique de la solution propre : surveillance **apprenante** de la fraîcheur des sensors énergétiques piliers.
+- **Périmètre** : 8 sensors énergétiques explicites (Ecojoko x4 + APSystems x2 + Anker x2) + 2 sensors HC/HP traités séparément.
+- **Architecture** :
+  - Table `sensor_heartbeat` (entity_id PRIMARY KEY, median_sec, p95_sec, p99_sec, samples_count, last_recompute, learning_started, learning_complete)
+  - Phase apprentissage : 7 jours d'observation silencieuse à l'installation du sensor
+  - Phase calibration : à J+7, calcul des seuils depuis `/api/history` HA (médiane, P95, P99)
+  - Phase surveillance : alerte si gap > P99×2 (warning, cooldown 6h) ou P99×5 (critique, cooldown 1h)
+  - Recompute hebdomadaire automatique pour s'adapter aux saisons
+- **Pourquoi pas de seuil hardcodé** : la mesure périodique des 8 sensors sur 24h a montré que les comportements sont très différents (ex: `ecojoko_consommation_temps_reel` médiane 1 min vs `ecojoko_surplus_de_production` médiane 3 min mais avec gaps légitimes de 7h la nuit). Un seuil unique de 30 min aurait généré des fausses alertes nocturnes.
+- **Pourquoi 1 seule commande Telegram (status, pas reset)** : le dispatcher de skills.py attend des fonctions sans argument qui retournent un string. Adapter le dispatcher pour supporter des sous-commandes touche 50+ commandes existantes — risque trop élevé pour un bénéfice mince.
+- **Reset de l'apprentissage si besoin (via SSH)** :
+  ```bash
+  # Reset complet (re-démarre l'apprentissage des 8 sensors)
+  sudo sqlite3 /home/lolufe/assistant/memory.db "DELETE FROM sensor_heartbeat;"
+  sudo systemctl restart assistant.service
+  
+  # Reset d'un seul sensor
+  sudo sqlite3 /home/lolufe/assistant/memory.db \
+    "DELETE FROM sensor_heartbeat WHERE entity_id='sensor.X';"
+  ```
+
+---
