@@ -139,3 +139,19 @@ Ajoutez vos pièges via GitHub Issue "Leçon fondatrice" avec :
   ```
 
 ---
+
+### Tarif Zen Week-End Plus mal géré par little_monkey (27/04/2026)
+
+- **Symptôme** : `sensor.ecojoko_consommation_hc_reseau` et `_hp_reseau` restent en `unknown` pendant des heures, déclenchant des fausses alertes heartbeat.
+- **Diagnostic** :
+  - Le tarif "EDF Zen Week-End Plus - Option Heures Creuses" est correctement configuré côté Ecojoko (vérifié sur service.ecojoko.com)
+  - L'intégration little_monkey v1.2.4 (la dernière) ne supporte explicitement que HP/HC classique et Tempo (Bleu/Blanc/Rouge) selon son README
+  - Zen Week-End Plus est un tarif hybride (HC quotidien + week-end + 1 jour au choix en HC) : ni HP/HC pur, ni Tempo
+  - Conséquence : little_monkey reçoit des `null` de l'API Ecojoko pour ces 2 capteurs spécifiques, et HA stocke `unknown`
+  - Le sensor `sensor.depense_du_jour_ecojoko` continue de fonctionner car calculé sans découpage HC/HP
+- **Décision** : décocher les capteurs HC/HP dans la configuration little_monkey HA → les entités disparaissent → plus de fausses alertes
+- **Conséquence acceptée** : pas de découpage HC/HP dans Home Assistant côté Ecojoko. Mais le bot AssistantIA détecte le tarif HC via d'autres entités (Linky/ZLinky/ESPHome/Tempo) en fallback (cf. skills.py L7600-7616), et sait calculer ses plages HC à partir d'historique
+- **Patch code** : `_HEARTBEAT_SENSORS_TARIF` vidée dans skills.py — plus de surveillance heartbeat sur ces 2 sensors
+- **Action future** : si little_monkey ajoute le support Zen Week-End Plus dans une version ultérieure, recocher les capteurs et ré-ajouter à la liste
+
+---

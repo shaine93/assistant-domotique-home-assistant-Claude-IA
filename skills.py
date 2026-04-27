@@ -10763,11 +10763,14 @@ _HEARTBEAT_SENSORS_PILIERS = [
     "sensor.solarbank_e1600_puissance_solaire",
     "sensor.solarbank_e1600_etat_de_charge",
 ]
-# HC/HP : 1 update/jour à minuit, traités à part avec seuil 26h
-_HEARTBEAT_SENSORS_TARIF = [
-    "sensor.ecojoko_consommation_hc_reseau",
-    "sensor.ecojoko_consommation_hp_reseau",
-]
+# HC/HP : liste vidée le 27/04/2026.
+# Raison : tarif EDF Zen Week-End Plus mal géré par little_monkey v1.2.4.
+# Les sensors restent en `unknown` indéfiniment → fausses alertes heartbeat.
+# Solution retenue : décocher les capteurs HC/HP dans little_monkey côté HA.
+# Conséquence : pas de découpage HC/HP dans HA, mais le bot détecte le tarif
+# via d'autres entités (Linky/ZLinky/ESPHome/Tempo) si présentes.
+# Si un jour little_monkey supporte Zen Week-End Plus, recocher et ré-ajouter.
+_HEARTBEAT_SENSORS_TARIF = []
 
 
 def _heartbeat_apprendre(entity_id):
