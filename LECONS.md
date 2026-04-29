@@ -155,3 +155,58 @@ Ajoutez vos pièges via GitHub Issue "Leçon fondatrice" avec :
 - **Action future** : si little_monkey ajoute le support Zen Week-End Plus dans une version ultérieure, recocher les capteurs et ré-ajouter à la liste
 
 ---
+
+### Source HC/HP indépendante via ha-linky (29/04/2026)
+
+- **Contexte** : suite au bug Zen Week-End Plus dans little_monkey (cf. leçon précédente), besoin d'une source HC/HP fiable pour les calculs d'économies du bot.
+- **Solution déployée** : add-on **ha-linky** (Bokub) connecté à l'API officielle Enedis via Conso API (`conso.boris.sh`).
+
+**Étapes réalisées et validées** :
+1. Activation de la **collecte horaire** dans le compte Enedis particulier
+2. Génération du **token Conso API** sur `conso.boris.sh` (consentement Enedis 3 ans)
+3. Installation de `ha-linky` v1.7.0 via dépôt HACS (https://github.com/bokub/ha-linky)
+4. Configuration tarif **EDF Zen Week-End Plus** :
+   - HC : mercredi + samedi + dimanche (jours entiers)
+   - HP : lundi, mardi, jeudi, vendredi
+   - **Pas de plage horaire 22h30-06h30** (la plage affichée dans le dashboard Ecojoko était un reliquat sans effet réel sur la facturation)
+5. Config YAML finale fonctionnelle :
+```yaml
+meters:
+  - prm: "22551085337904"
+    token: <TOKEN_CONSO_API>
+    name: Linky conso
+    action: sync
+    production: false
+costs:
+  - price: 0.1685
+    weekday: [wed, sat, sun]
+  - price: 0.2248
+    weekday: [mon, tue, thu, fri]
+```
+
+**Pièges rencontrés (à savoir pour les futurs setups)** :
+- `costs:` doit être au **niveau racine** du YAML, pas indenté dans `meters:`. Sinon erreur "Missing option 'costs' in root".
+- Le champ `name:` n'existe **PAS** dans `costs:` (uniquement dans `meters:`). L'éditeur HA le supprime silencieusement à l'enregistrement.
+- `action: reset` **supprime** les statistiques sans réimporter. Pour appliquer rétroactivement les règles `costs:`, il faut faire `reset` puis repasser en `sync` immédiatement.
+- Les statistiques `Linky conso (costs)` n'apparaissent **qu'après** un import complet avec règles `costs:` valides. Si import fait sans `costs:` puis ajout des règles, il faut reset+sync.
+- Conso API ne stocke aucun token : régénérer le token = ancien invalidé. Une fois généré, il faut le copier immédiatement.
+
+**Résultat obtenu** :
+- 1030 points de consommation importés (1 an d'historique du 29/04/2025 au 28/04/2026)
+- Coûts calculés rétroactivement sur tout l'historique selon le tarif Zen Week-End Plus
+- Sync auto quotidienne planifiée à 6h15 et 9h15
+- Tableau Énergie HA configuré et fonctionnel
+
+**Chantier ouvert pour la prochaine session** :
+1. **Sensors Ecojoko HC/HP fantômes** : malgré le décochage côté little_monkey, `sensor.ecojoko_consommation_hc_reseau` et `_hp_reseau` apparaissent toujours dans `/api/states`. À investiguer (HA garde-t-il les entités décochées ? Faut-il un redémarrage HA ?). Tant que ces sensors existent en `unknown`, le skill heartbeat ne les surveillera pas (liste `_HEARTBEAT_SENSORS_TARIF` vidée le 27/04), mais c'est un état incohérent.
+2. **Patch AssistantIA pour exploiter ha-linky** : non trivial. ha-linky n'expose **PAS** de sensors HA classiques (pas de `sensor.linky_*` dans `/api/states`), uniquement des **statistiques** consultables via `/api/recorder/statistics_during_period`. Deux options :
+   - Créer un **sensor template HA** (YAML) qui expose `Linky conso (costs)` comme sensor lisible
+   - Patcher AssistantIA pour interroger l'API recorder/statistics directement
+3. **Finaliser la config tarif du bot** : `tarif_temp_data` contient bien `weekend_plus` mais n'a jamais été promu en `tarif` (officiel). Le bot fonctionne actuellement via sa logique de plages horaires + son tarif mémorisé.
+
+**Important pour la prochaine instance Claude** : avant de patcher skills.py pour utiliser ha-linky, vérifier :
+- Que les données du jour J-1 sont bien arrivées (Enedis livre entre 6h-10h le lendemain)
+- Que les statistiques `Linky conso` et `Linky conso (costs)` sont visibles dans Outils Dev → Statistiques
+- Quel format d'API recorder utiliser : la doc HA officielle est ici → https://www.home-assistant.io/docs/configuration/state_object/
+
+---
