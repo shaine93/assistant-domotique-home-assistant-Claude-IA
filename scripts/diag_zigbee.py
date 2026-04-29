@@ -1,95 +1,49 @@
 #!/usr/bin/env python3
-"""Diag little_monkey + test direct API Ecojoko."""
-import os, json, sqlite3, glob
+"""Vérifier l'état de la mémoire tarif + ce que voit le bot maintenant."""
+import sqlite3
+DB = '/home/lolufe/assistant/memory.db'
+conn = sqlite3.connect(DB)
 
-# 1. Version installée
-print("=== VERSION little_monkey ===")
-manifest_paths = glob.glob("/usr/share/hassio/homeassistant/custom_components/little_monkey/manifest.json")
-manifest_paths += glob.glob("/config/custom_components/little_monkey/manifest.json")
-manifest_paths += glob.glob("/root/homeassistant/custom_components/little_monkey/manifest.json")
+print("=== Memory : tout ce qui touche au tarif HC ===")
+rows = conn.execute(
+    "SELECT cle, valeur FROM memoire WHERE cle LIKE '%tarif%' OR cle LIKE '%hc%' OR cle LIKE '%hp%' OR cle LIKE '%heure_creuse%'"
+).fetchall()
+if rows:
+    for r in rows:
+        print(f"  {r[0]} = {r[1][:200] if r[1] else None}")
+else:
+    print("  (aucune entrée)")
 
-# Aussi via API HA
-try:
-    import requests
-    with open('/home/lolufe/assistant/config.json') as f: cfg = json.load(f)
-    
-    # Voir si on peut accéder au custom_components via SSH HA (improbable)
-    # Plus simple : passer par /api/error_log ou /api/integrations
-    
-    # Via /api/components donne juste les domains, pas la version
-    # Passer par le sensor "Ecojoko" qui contient peut-être la version
-    r = requests.get(f"{cfg['ha_url']}/api/states/sensor.ecojoko",
-                     headers={"Authorization": f"Bearer {cfg['ha_token']}"},
-                     timeout=10, verify=False)
-    if r.status_code == 200:
-        data = r.json()
-        print(f"  sensor.ecojoko state: {data.get('state')} (probable version)")
-        for k, v in data.get('attributes', {}).items():
-            print(f"    {k}: {v}")
-except Exception as e:
-    print(f"  err: {e}")
+# Aussi : tarif actuel mémorisé
+print("\n=== Tarif actif (config) ===")
+rows = conn.execute("SELECT cle, valeur FROM memoire WHERE cle = 'tarif_actuel' OR cle LIKE '%tarif_config%'").fetchall()
+for r in rows: print(f"  {r[0]} = {r[1][:300] if r[1] else None}")
+conn.close()
 
-# 2. Update intégration disponible ?
-print("\n=== UPDATE little_monkey ===")
-try:
-    r = requests.get(f"{cfg['ha_url']}/api/states/update.little_monkey_update",
-                     headers={"Authorization": f"Bearer {cfg['ha_token']}"},
-                     timeout=10, verify=False)
-    if r.status_code == 200:
-        data = r.json()
-        attrs = data.get('attributes', {})
-        print(f"  state: {data.get('state')}")
-        print(f"  installed_version: {attrs.get('installed_version','?')}")
-        print(f"  latest_version: {attrs.get('latest_version','?')}")
-        print(f"  release_summary: {attrs.get('release_summary','')[:300]}")
-        print(f"  release_url: {attrs.get('release_url','')}")
-except Exception as e:
-    print(f"  err: {e}")
+# Vérifier dans HA si la stat Linky HC/HP est bien présente
+import json, requests
+with open('/home/lolufe/assistant/config.json') as f: cfg = json.load(f)
+r = requests.get(f"{cfg['ha_url']}/api/states",
+                 headers={"Authorization": f"Bearer {cfg['ha_token']}"},
+                 timeout=15, verify=False)
+states = r.json()
 
-# 3. Autres switches (pre_release etc.)
-print("\n=== switch.little_monkey_pre_release ===")
-try:
-    r = requests.get(f"{cfg['ha_url']}/api/states/switch.little_monkey_pre_release",
-                     headers={"Authorization": f"Bearer {cfg['ha_token']}"},
-                     timeout=10, verify=False)
-    if r.status_code == 200:
-        data = r.json()
-        print(f"  state: {data.get('state')}")
-        for k, v in data.get('attributes', {}).items():
-            print(f"    {k}: {v}")
-except Exception as e:
-    print(f"  err: {e}")
+print("\n=== Toutes les entités liées à Linky / linky / ha-linky ===")
+matched = [s for s in states if 'linky' in s['entity_id'].lower()]
+for s in matched:
+    eid = s['entity_id']
+    state = s['state']
+    fname = s.get('attributes', {}).get('friendly_name', '')
+    print(f"  {eid}: state={state} fname={fname}")
 
-# 4. Voir l'historique HC/HP sur 30 jours pour comprendre quand ils ont arrêté de fonctionner
-from datetime import datetime, timedelta, timezone
-print("\n=== Historique HC sur 30 jours (1 sample tous les 3 jours) ===")
-start = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-url = f"{cfg['ha_url']}/api/history/period/{start}?filter_entity_id=sensor.ecojoko_consommation_hc_reseau&minimal_response&no_attributes"
-try:
-    r = requests.get(url, headers={"Authorization": f"Bearer {cfg['ha_token']}"},
-                     timeout=30, verify=False)
-    data = r.json()
-    if data and data[0]:
-        h = data[0]
-        print(f"  {len(h)} updates sur 30 jours")
-        # Garder 1 sample par jour pour visualiser
-        seen_dates = set()
-        for entry in h:
-            ts = entry.get('last_changed', entry.get('last_updated', ''))
-            date = ts[:10]
-            state = entry.get('state', '')
-            if date not in seen_dates:
-                seen_dates.add(date)
-                print(f"    {date}  state={state}")
-            elif state == "unknown":
-                # Toujours signaler les unknown
-                pass
-except Exception as e:
-    print(f"  err: {e}")
+if not matched:
+    print("  (aucune entité Linky visible — les statistiques peuvent être invisibles via /api/states)")
 
-# 5. Tester l'API Ecojoko native (si on a les creds dans config.json)
-print("\n=== Test API Ecojoko native (lecture seule) ===")
-# little_monkey utilise probablement les creds Ecojoko, pas dans /home/lolufe/assistant/config.json
-# Mais les creds existent dans HA, on peut juste vérifier si l'intégration tourne :
-print("  (creds Ecojoko stockés dans HA, pas accessibles depuis ici)")
-print("  → Conclusion via les sensors HA uniquement")
+# Test auto-détection HC
+print("\n=== Test auto-détection HC : recherche des entités matchant les mots-clés du bot ===")
+keywords = ["hchc", "hchp", "index_hc", "index_hp", "consommation_hc", "consommation_hp",
+            "off_peak_hours_index", "peak_hours_index"]
+for s in states:
+    eid_low = s['entity_id'].lower()
+    if any(k in eid_low for k in keywords):
+        print(f"  ✅ {s['entity_id']}")
