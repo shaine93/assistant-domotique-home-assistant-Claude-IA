@@ -197,9 +197,11 @@ costs:
 - Sync auto quotidienne planifiée à 6h15 et 9h15
 - Tableau Énergie HA configuré et fonctionnel
 
-**Chantier ouvert pour la prochaine session** :
-1. **Sensors Ecojoko HC/HP fantômes** : malgré le décochage côté little_monkey, `sensor.ecojoko_consommation_hc_reseau` et `_hp_reseau` apparaissent toujours dans `/api/states`. À investiguer (HA garde-t-il les entités décochées ? Faut-il un redémarrage HA ?). Tant que ces sensors existent en `unknown`, le skill heartbeat ne les surveillera pas (liste `_HEARTBEAT_SENSORS_TARIF` vidée le 27/04), mais c'est un état incohérent.
-2. **Patch AssistantIA pour exploiter ha-linky** : non trivial. ha-linky n'expose **PAS** de sensors HA classiques (pas de `sensor.linky_*` dans `/api/states`), uniquement des **statistiques** consultables via `/api/recorder/statistics_during_period`. Deux options :
+**Chantier RÉSOLU le 29/04/2026 (en fin de session)** :
+1. ✅ **Sensors Ecojoko HC/HP fantômes** : confirmés comme entités orphelines (HA conserve les entités même après décochage de l'intégration source). Suppression manuelle effectuée via Paramètres → Appareils et services → Entités → engrenage → Supprimer. État maintenant propre, plus aucune référence aux sensors HC/HP Ecojoko dans HA.
+
+**Chantiers ouverts pour la prochaine session** :
+1. **Patch AssistantIA pour exploiter ha-linky** : non trivial. ha-linky n'expose **PAS** de sensors HA classiques (pas de `sensor.linky_*` dans `/api/states`), uniquement des **statistiques** consultables via `/api/recorder/statistics_during_period`. Deux options :
    - Créer un **sensor template HA** (YAML) qui expose `Linky conso (costs)` comme sensor lisible
    - Patcher AssistantIA pour interroger l'API recorder/statistics directement
 3. **Finaliser la config tarif du bot** : `tarif_temp_data` contient bien `weekend_plus` mais n'a jamais été promu en `tarif` (officiel). Le bot fonctionne actuellement via sa logique de plages horaires + son tarif mémorisé.
