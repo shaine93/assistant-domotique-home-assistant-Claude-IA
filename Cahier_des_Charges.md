@@ -1,10 +1,11 @@
-# 📋 CAHIER DES CHARGES — AssistantIA Domotique v8.0
+# 📋 CAHIER DES CHARGES — AssistantIA Domotique v8.1
 ## Un agent IA conversationnel et autonome pour votre Home Assistant.
 
-**Version** : 8.0
-**Date** : 24/04/2026
-**Script** : 4 fichiers | 22 tables | 11 threads | 18 skills | 51 commandes | 25 rôles
+**Version** : 8.1
+**Date** : 29/04/2026
+**Script** : 4 fichiers | 23 tables | 11 threads | 19 skills | 52 commandes | 25 rôles
 **Statut public** : v2.0 bêta — repo GitHub propre et installable (24/04/2026)
+**Évolutions v8.1** : skill apprenant heartbeat_pilier (26/04) + source HC/HP indépendante via ha-linky (29/04)
 
 ---
 
@@ -96,6 +97,134 @@ POST sécurisé pour modifier des clés de `config.json` via le deploy_server :
 - Backup horodaté dans `versions/config.json.bak.YYYYMMDD_HHMMSS`
 - Les valeurs ne sont **jamais** loguées
 - Requiert HMAC-SHA256 comme tout endpoint POST
+
+---
+
+## 💓 SKILL HEARTBEAT_PILIER — Surveillance apprenante (26/04/2026)
+
+### Contexte
+
+Le 24/04, un sensor Ecojoko critique est resté figé en `unknown` pendant 6h sans alerter. Diagnostic : 3 systèmes de surveillance offline cassés simultanément (filtre `linkquality` absent, table `zigbee_absences` polluée, garde 1×/jour avec seuil 24h trop conservateur). Plutôt que de patcher en urgence (rollback de 2 patches), un nouveau skill **apprenant** a été conçu en validation conjointe.
+
+### Périmètre
+
+8 sensors énergétiques piliers (Ecojoko + APSystems + Anker) + 2 sensors HC/HP traités à part :
+
+```python
+_HEARTBEAT_SENSORS_PILIERS = [
+    "sensor.ecojoko_consommation_temps_reel",
+    "sensor.ecojoko_consommation_reseau",
+    "sensor.ecojoko_surplus_de_production",
+    "sensor.ecojoko_humidite_interieure",
+    "sensor.ecu_current_power",
+    "sensor.ecu_today_energy",
+    "sensor.solarbank_e1600_puissance_solaire",
+    "sensor.solarbank_e1600_etat_de_charge",
+]
+_HEARTBEAT_SENSORS_TARIF = []  # vidée le 27/04 (cf. bug Zen Week-End Plus)
+```
+
+### Architecture
+
+Table `sensor_heartbeat` dédiée :
+
+| Colonne | Type | Rôle |
+|---|---|---|
+| entity_id | TEXT PK | identifiant entité HA |
+| median_sec | INTEGER | médiane des intervalles entre updates |
+| p95_sec | INTEGER | 95e percentile (gap "normal max") |
+| p99_sec | INTEGER | 99e percentile (gap "rare mais possible") |
+| samples_count | INTEGER | nb d'observations utilisées |
+| learning_started | TEXT | date de démarrage de l'apprentissage |
+| learning_complete | INTEGER | 0 = en apprentissage, 1 = seuils actifs |
+| last_recompute | TEXT | dernière re-calibration |
+
+### 3 phases automatiques
+
+1. **Apprentissage (J0 → J7)** : observation silencieuse, aucune alerte
+2. **Calibration (J7)** : récupération de 7 jours d'historique HA via `/api/history`, calcul médiane/P95/P99
+3. **Surveillance (J7+)** : alerte si gap > P99×2 (warning, cooldown 6h) ou P99×5 (critique, cooldown 1h)
+
+Recompute hebdomadaire automatique pour s'adapter aux saisons.
+
+### Commandes Telegram
+
+- `/heartbeat` — affiche le statut des sensors piliers (apprentissage en cours / seuils actifs / gap actuel)
+- Reset via SSH : `sudo sqlite3 memory.db "DELETE FROM sensor_heartbeat;"` puis `systemctl restart assistant.service`
+
+### Décisions clés
+
+- **Pas de seuil hardcodé** : la mesure de périodicité réelle des sensors a montré des gaps légitimes très différents selon le sensor (ex. `consommation_temps_reel` médiane 1 min vs `surplus_de_production` gaps nocturnes de 7-8h normaux). Un seuil unique aurait généré des fausses alertes.
+- **Apprentissage 7 jours fixes** (pas adaptatif) : capture jour/nuit + semaine/weekend en une fois.
+- **Périmètre explicite** (pas auto-élu) : focus sur les sensors énergétiques au cœur du produit, pas sur les 750 entités HA.
+- **Une seule commande Telegram** (status, pas reset) : compatible avec le dispatcher actuel zéro-arg/return-string.
+
+### Référence
+
+Cf. `LECONS.md` (section "Skill heartbeat_pilier") pour le récit complet et les pièges rencontrés.
+
+---
+
+## ⚡ SOURCE HC/HP INDÉPENDANTE — ha-linky (29/04/2026)
+
+### Contexte
+
+Le tarif **EDF Zen Week-End Plus** n'est pas supporté par l'intégration HA `little_monkey` v1.2.4 (Ecojoko). Les sensors `sensor.ecojoko_consommation_hc_reseau` et `_hp_reseau` restent en `unknown` indéfiniment. Le mainteneur de little_monkey ne peut pas corriger : Ecojoko refuse de partager le code source / la documentation API. Issue GitHub #108 ouverte le 02/02/2026, jamais répondue.
+
+### Solution déployée
+
+Add-on **ha-linky** (Bokub) connecté à l'API officielle Enedis via Conso API (`conso.boris.sh`).
+
+| Composant | Rôle |
+|---|---|
+| Compte Enedis particulier | Activation de la **collecte au pas horaire** (obligatoire) |
+| `conso.boris.sh` | Génération du token via consentement Enedis (3 ans) |
+| `ha-linky` v1.7.0 | Add-on HA qui consomme l'API Conso et alimente les statistiques HA |
+| Tableau Énergie HA | Affichage conso + coûts ventilés HC/HP |
+
+### Configuration finale
+
+```yaml
+meters:
+  - prm: "<PDL_14_CHIFFRES>"
+    token: "<TOKEN_CONSO_API>"
+    name: Linky conso
+    action: sync
+    production: false
+costs:
+  - price: 0.1685
+    weekday: [wed, sat, sun]
+  - price: 0.2248
+    weekday: [mon, tue, thu, fri]
+```
+
+Prix en €/kWh, à ajuster selon tarif réel. Tarif Zen Week-End Plus = HC sur **jours entiers** (mercredi + samedi + dimanche), pas de plage horaire.
+
+### Pièges rencontrés
+
+- `costs:` doit être au **niveau racine** du YAML, pas indenté dans `meters:`
+- Le champ `name:` n'existe **pas** dans les règles `costs:` (uniquement dans `meters:`)
+- `action: reset` **supprime** les statistiques sans réimporter — il faut repasser en `sync` immédiatement après
+- Conso API ne stocke aucun token : régénération = ancien invalidé
+- ha-linky n'expose **aucun sensor HA classique** dans `/api/states`, uniquement des **statistiques** consultables via `/api/recorder/statistics_during_period`
+
+### Conséquences pour AssistantIA
+
+- Capteurs HC/HP **décochés** côté little_monkey (28/04) — entités fantômes ensuite supprimées manuellement (29/04)
+- `_HEARTBEAT_SENSORS_TARIF` vidée dans skills.py (commit `c302f22`)
+- Le bot continue de fonctionner via sa logique tarif autonome (`tarif_temp_data` mémorise `weekend_plus`)
+- **Patch AssistantIA pour exploiter ha-linky** : reporté à une session dédiée (chantier ouvert documenté dans LECONS.md)
+
+### Résultat
+
+- 1030 points de consommation importés (1 an d'historique du 29/04/2025 au 28/04/2026)
+- Coûts calculés rétroactivement sur tout l'historique selon le tarif Zen Week-End Plus
+- Sync auto quotidienne planifiée à 6h15 et 9h15 (livraison Enedis en J+1)
+- Tableau Énergie HA fonctionnel avec graphiques conso + coûts en euros
+
+### Référence
+
+Cf. `LECONS.md` (sections "Tarif Zen Week-End Plus mal géré par little_monkey" et "Source HC/HP indépendante via ha-linky") pour le récit complet et les chantiers ouverts.
 
 ---
 

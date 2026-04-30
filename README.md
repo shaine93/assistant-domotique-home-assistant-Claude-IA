@@ -51,6 +51,14 @@ Ce n'est pas un remplaçant pour vos automations existantes. C'est une **couche 
 | 3 | **Clé API Anthropic** | [console.anthropic.com](https://console.anthropic.com) | Variable (voir ci-dessous) |
 | 4 | **Une machine Linux** (Pi, VM, NAS, HA Add-on...) | Voir tableau matériel | Variable |
 
+### 🔌 Données HC/HP fiables — recommandation (optionnel)
+
+Si vous avez un compteur **Linky** et un tarif **Heures Creuses** (Tarif Bleu HC/HP, Zen Week-End Plus, Tempo, etc.), je vous recommande l'add-on [**ha-linky**](https://github.com/bokub/ha-linky) (Bokub) comme source officielle de votre consommation HC/HP. Il s'appuie sur l'API Enedis via [Conso API](https://conso.boris.sh) (gratuit, consentement Enedis 3 ans).
+
+**Pourquoi ?** Les intégrations énergie tierces (Ecojoko, capteurs Zigbee divers...) ne supportent pas tous les tarifs EDF. Notamment **Zen Week-End Plus** n'est pas supporté par `little_monkey` v1.2.4. ha-linky lit directement Enedis, donc compatible avec **tous les tarifs**.
+
+Données livrées en J+1 (la veille au matin), donc ce n'est pas du temps réel — mais c'est fiable et officiel.
+
 ## 🚀 Installation rapide
 
 Quatre méthodes supportées. **Choisissez celle qui correspond à votre matériel** :
