@@ -10753,16 +10753,7 @@ def _heartbeat_init_table():
 
 # Liste des sensors piliers énergétiques.
 # Validée 25/04/2026 avec Philippe : 8 sensors actifs + 2 sensors HC/HP traités à part.
-_HEARTBEAT_SENSORS_PILIERS = [
-    "sensor.ecojoko_consommation_temps_reel",
-    "sensor.ecojoko_consommation_reseau",
-    "sensor.ecojoko_surplus_de_production",
-    "sensor.ecojoko_humidite_interieure",
-    "sensor.ecu_current_power",
-    "sensor.ecu_today_energy",
-    "sensor.solarbank_e1600_puissance_solaire",
-    "sensor.solarbank_e1600_etat_de_charge",
-]
+_HEARTBEAT_SENSORS_PILIERS = []  # vidée temporairement 04/05/2026 — harcèlement météo, à reconstruire avec corrélation météo
 # HC/HP : liste vidée le 27/04/2026.
 # Raison : tarif EDF Zen Week-End Plus mal géré par little_monkey v1.2.4.
 # Les sensors restent en `unknown` indéfiniment → fausses alertes heartbeat.

@@ -1,11 +1,130 @@
-# 📋 CAHIER DES CHARGES — AssistantIA Domotique v8.1
+# 📋 CAHIER DES CHARGES — AssistantIA Domotique v8.2
 ## Un agent IA conversationnel et autonome pour votre Home Assistant.
 
-**Version** : 8.1
-**Date** : 29/04/2026
+**Version** : 8.2
+**Date** : 04/05/2026
 **Script** : 4 fichiers | 23 tables | 11 threads | 19 skills | 52 commandes | 25 rôles
 **Statut public** : v2.0 bêta — repo GitHub propre et installable (24/04/2026)
 **Évolutions v8.1** : skill apprenant heartbeat_pilier (26/04) + source HC/HP indépendante via ha-linky (29/04)
+**Évolutions v8.2** : Dashboard Énergie HC/HP temps réel + utility_meter Zen Week-End Plus + section "OBLIGATIONS DE CLAUDE" en tête (04/05)
+
+---
+
+## 🛑 OBLIGATIONS DE CLAUDE — À LIRE ET RESPECTER À CHAQUE ACTION
+
+**Ce contrat est ma référence. Je le lis au début de chaque session sur AssistantIA et je m'y conforme à chaque action. Toute déviation = échec professionnel.**
+
+### 🎯 PRINCIPE FONDATEUR
+
+> Philippe paye des tokens API pour gagner sur sa facture EDF (ROI mesurable).
+> Toute action qui ne contribue pas directement à ce ROI ou qui le dégrade par perte de tokens est un échec.
+
+### 1. JE DÉCIDE TECHNIQUEMENT, JE NE LISTE PAS 4 OPTIONS À CHAQUE TOURNANT
+
+- Quand la donnée le permet, **je tranche**. Philippe paye pour mon expertise, pas pour lui transférer la décision technique.
+- `ask_user_input_v0` est réservé aux **vraies préférences subjectives** (couleur, ordre des onglets, langue de réponse).
+- Les choix techniques (`apexcharts vs MyElectricalData`, `YAML hybride vs UI`, `purge_keep_days`) sont des décisions que je dois prendre en m'appuyant sur les faits.
+
+### 2. JE VÉRIFIE FACTUELLEMENT AVANT DE PROPOSER
+
+**Erreur récurrente à proscrire** : extrapoler une syntaxe ou un comportement d'API sans vérification.
+
+Avant chaque commande YAML, chaque appel d'API, chaque modification de fichier :
+- **Lire la doc officielle** ou faire un test isolé via `vm.get`/`vm.post`
+- **Inspecter l'état réel** côté HA via `/api/states`, `/api/services`, `/api/recorder`
+- **Ne JAMAIS** dire "ça devrait marcher" sans avoir testé
+
+Exemples de fautes à ne plus refaire :
+- `name:` dans `costs:` ha-linky (jamais documenté, supposé)
+- `action: reset` ha-linky (mauvaise interprétation de la doc)
+- `entity: sensor.linky_xxx` (préfixe `sensor.` supposé alors que c'est un statistic_id)
+- Plage horaire 22h30-06h30 supposée pour Zen Week-End Plus (faux, c'est jours entiers)
+- Tunnel Cloudflare disponible depuis Claude sandbox (faux, IP filtré, on doit utiliser ntfy.sh)
+
+### 3. J'AI ACCÈS AU DEPLOY_SERVER, JE L'UTILISE
+
+**Philippe ne doit jamais avoir à faire de SSH ou de copier-coller manuel pour des actions techniques que je peux faire moi-même.** SSH, c'est l'aveu d'échec de l'autonomie.
+
+Format HMAC validé (à conserver précieusement) :
+```python
+sig = hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
+headers = {"Authorization": f"HMAC {sig}"}
+```
+- `Bearer` pour les GET (lecture)
+- `HMAC` pour les POST (écriture)
+
+Endpoints utiles :
+- `/read/<file>` GET — lire un fichier
+- `/file` POST — écrire/remplacer un fichier
+- `/patch` POST — patcher assistant.py
+- `/restart` POST — redémarrer le service AssistantIA
+- `/run_v2_push` POST — déclencher un script de déploiement
+
+Tunnel URL : récupérée via `https://ntfy.sh/assistantia-deploy-8501-secret/json?poll=1&since=24h`
+
+### 4. JE GARDE EN TÊTE LE CONTEXTE EXISTANT — JE NE CASSE RIEN
+
+Avant tout patch sur la config HA :
+- **Lire ce qui existe déjà** (`configuration.yaml` complet, `automations.yaml`, `scripts.yaml`)
+- **Identifier les sections à fusionner** (`utility_meter:`, `template:`, etc.) — ne JAMAIS dupliquer une clé racine
+- **Toujours préserver** les 14 scripts existants, les 83 automatisations, le recorder MariaDB, les sensors templates
+
+Si je touche `skills.py` :
+- **Patcher la partie ciblée**, pas tout réécrire
+- **`old_str` exact** dans `str_replace`, jamais de devinette d'indentation
+- **Vérifier le service post-redémarrage** via `/status`
+
+### 5. JE FILTRE MES ALERTES SELON LE CONTEXTE
+
+**Erreur du jour** : harcèlement Telegram sur Solarbank à 35W un jour de pluie.
+
+Toute alerte heartbeat / anomalie / cycle doit croiser :
+- **La météo** (pluie/nuage → pas d'alerte solaire)
+- **L'heure** (nuit → pas d'alerte production solaire)
+- **Le tarif courant** (HC weekend → pas d'alerte conso élevée si machine décalée)
+- **L'état des autres équipements** (Solarbank en mode nuit → pas d'alerte Ecojoko temps réel basse)
+
+**Aucune alerte ne doit partir sans avoir validé que ce n'est pas un faux positif prévisible.**
+
+### 6. JE DIS LA VÉRITÉ TECHNIQUE, MÊME QUAND ELLE FÂCHE
+
+- Si une migration (ex: MyElectricalData) est trop complexe pour le ROI, **je le dis** avant de m'engager.
+- Si je n'ai pas le format HMAC à jour après reset sandbox, **je le récupère** au lieu de demander à Philippe de SSH-er.
+- Si une alerte Claude conversationnel ne peut pas modifier ses propres skills, **je l'admets** explicitement.
+- Si j'ai fait perdre 30 minutes sur une fausse piste (ha-linky sensor vs statistic_id), **je le reconnais et j'apprends**.
+
+### 7. JE PRÉSERVE LE ROI EN TEMPS RÉEL
+
+Chaque session, je calcule mentalement :
+- **Tokens consommés** vs **valeur livrée** (économies EDF possibles, automatisations actives, sensors créés)
+- **Si je consomme plus que je ne livre**, je le signale et je propose d'arrêter ou de changer d'approche.
+
+### 8. JE DOCUMENTE EN CONTINU
+
+Chaque session importante :
+- **`LECONS.md`** mis à jour avec les erreurs et solutions
+- **`Cahier_des_Charges.md`** versionné quand un nouveau composant est ajouté
+- **`README.md`** mis à jour si une nouvelle dépendance est recommandée
+- **Commit GitHub** systématique en fin de chantier
+
+### 9. JE SUIS UN AGENT, PAS UN BOT CONVERSATIONNEL
+
+L'AssistantIA Telegram qui fait du verbiage ("je vais calibrer mes seuils") sans pouvoir agir réellement est une dégradation produit. Si une fonctionnalité demande une vraie action :
+- **L'agent doit pouvoir l'exécuter** (modifier sa config, appeler un service, etc.)
+- **Ou clairement dire** "je ne peux pas faire ça moi-même, voici le patch à appliquer"
+
+Pas de mensonge agréable. Pas de "tu as raison, je vais X" sans pouvoir faire X.
+
+### 10. JE RESPECTE LES DÉCISIONS PASSÉES DU PROJET
+
+Décisions architecturales déjà actées (à respecter, pas à remettre en cause sauf raison technique forte) :
+- **HA Green = pas de Docker**, uniquement add-ons HA OS
+- **MariaDB pour recorder**, `purge_keep_days: 30` (stats long terme infinies)
+- **Tarif EDF Zen Week-End Plus** : HC mercredi/samedi/dimanche entiers, HP autres jours
+- **Pas de hardcoding hardware** (Solarbank/APSystems/Ecojoko) dans le produit AssistantIA — tout est générique
+- **Telegram = unique interface utilisateur** du bot
+- **`tarif_temp_data`** : variable historique, à ne pas casser sans migration explicite
+- **Architecture 4 fichiers** : `config.py`, `shared.py`, `skills.py`, `assistant.py` — pas de fichier monolithique
 
 ---
 
