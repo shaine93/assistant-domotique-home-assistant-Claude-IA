@@ -10751,9 +10751,24 @@ def _heartbeat_init_table():
         log.debug(f"heartbeat_init_table: {e}")
 
 
-# Liste des sensors piliers énergétiques.
+# Liste des sensors piliers énergétiques avec guards contextuels.
 # Validée 25/04/2026 avec Philippe : 8 sensors actifs + 2 sensors HC/HP traités à part.
-_HEARTBEAT_SENSORS_PILIERS = []  # vidée temporairement 04/05/2026 — harcèlement météo, à reconstruire avec corrélation météo
+# Reconstruite 05/05/2026 avec guards météo après harcèlement Solarbank en jours nuageux.
+#
+# Format : (entity_id, guard_name) où guard_name ∈ {"none", "solar", "battery_full"}
+#   - "none"          : alerte systématique si gap > seuil (sensor doit être 24/7)
+#   - "solar"         : alerte étouffée si soleil sous horizon, pluie >60%, ou couverture nuageuse forte
+#   - "battery_full"  : alerte étouffée si SOC ≥ 99% (saturation = updates rares normales) ou nuit profonde
+_HEARTBEAT_SENSORS_PILIERS = [
+    ("sensor.ecojoko_consommation_temps_reel",   "none"),
+    ("sensor.ecojoko_consommation_reseau",       "none"),
+    ("sensor.ecojoko_surplus_de_production",     "solar"),         # surplus = solaire injecté, dépend du soleil
+    ("sensor.ecojoko_humidite_interieure",       "none"),
+    ("sensor.ecu_current_power",                 "solar"),         # APSystems instantané
+    ("sensor.ecu_today_energy",                  "solar"),         # APSystems cumulé jour
+    ("sensor.solarbank_e1600_puissance_solaire", "solar"),         # Anker entrée solaire
+    ("sensor.solarbank_e1600_etat_de_charge",    "battery_full"),  # Anker SOC
+]
 # HC/HP : liste vidée le 27/04/2026.
 # Raison : tarif EDF Zen Week-End Plus mal géré par little_monkey v1.2.4.
 # Les sensors restent en `unknown` indéfiniment → fausses alertes heartbeat.
@@ -10815,6 +10830,103 @@ def _heartbeat_apprendre(entity_id):
         return None
 
 
+def _heartbeat_guard_actif(guard_name, index, now):
+    """Retourne True si l'alerte heartbeat doit être ÉTOUFFÉE pour ce contexte.
+    
+    Les guards évitent les fausses alertes sur les sensors dont le rythme de mise à jour
+    dépend du contexte météo/temporel.
+    
+    Guards supportés :
+      - "none"          : pas de filtrage (alerte systématique)
+      - "solar"         : étouffe si soleil sous horizon, pluie probable >60%,
+                          ou couverture nuageuse forte (state weather rainy/snowy/fog/cloudy)
+      - "battery_full"  : étouffe si SOC ≥ 99% (saturation Anker) ou nuit profonde (22h-6h)
+    
+    Tous les checks sont défensifs : si une entité météo manque, on retourne False
+    (pas de filtrage) plutôt que de bloquer. Mieux vaut une fausse alerte qu'une absence
+    silencieuse de surveillance.
+    
+    Ajouté 05/05/2026 — corrélation météo pour heartbeat_pilier.
+    """
+    if not guard_name or guard_name == "none":
+        return False
+    
+    try:
+        # ═══ Guard SOLAR ═══
+        if guard_name == "solar":
+            # 1. Soleil sous horizon → 0W normal sur tout sensor solaire
+            sun_e = index.get("sun.sun")
+            if sun_e and sun_e.get("state") == "below_horizon":
+                return True
+            
+            # 2. Pluie probable > 60% → production très réduite, gaps normaux
+            try:
+                rain_eid = role_get("meteo_risque_pluie") if "role_get" in globals() else None
+            except Exception:
+                rain_eid = None
+            rain_eid = rain_eid or "sensor.pavillons_sous_bois_rain_chance"
+            rain_e = index.get(rain_eid)
+            if rain_e:
+                state = rain_e.get("state", "")
+                try:
+                    if float(state) > 60:
+                        return True
+                except (ValueError, TypeError):
+                    pass
+            
+            # 3. État weather global défavorable au solaire
+            # Chercher d'abord via rôle, puis fallback weather.pavillons_sous_bois
+            weather_eid = None
+            for eid in index.keys():
+                if eid.startswith("weather.") and "forecast" not in eid.lower():
+                    weather_eid = eid
+                    break
+            if weather_eid:
+                w_e = index.get(weather_eid)
+                if w_e:
+                    wstate = w_e.get("state", "").lower()
+                    if wstate in ("rainy", "pouring", "snowy", "snowy-rainy", "fog", "cloudy", "hail"):
+                        return True
+                    # Si attribut cloud_coverage disponible → > 80%
+                    attrs = w_e.get("attributes", {})
+                    cloud = attrs.get("cloud_coverage")
+                    if cloud is not None:
+                        try:
+                            if float(cloud) > 80:
+                                return True
+                        except (ValueError, TypeError):
+                            pass
+            return False
+        
+        # ═══ Guard BATTERY_FULL ═══
+        if guard_name == "battery_full":
+            # 1. SOC ≥ 99% → batterie saturée, le sensor cesse d'updater souvent
+            soc_e = index.get("sensor.solarbank_e1600_etat_de_charge")
+            if soc_e:
+                try:
+                    if float(soc_e.get("state", 0)) >= 99:
+                        return True
+                except (ValueError, TypeError):
+                    pass
+            
+            # 2. Nuit profonde (22h-6h) avec soleil sous horizon → batterie immobile
+            sun_e = index.get("sun.sun")
+            if sun_e and sun_e.get("state") == "below_horizon":
+                try:
+                    h = now.hour if hasattr(now, "hour") else datetime.now().hour
+                    if h >= 22 or h <= 6:
+                        return True
+                except Exception:
+                    pass
+            return False
+    
+    except Exception as e:
+        log.debug(f"heartbeat_guard_actif({guard_name}): {e}")
+        return False  # En cas d'erreur, ne pas bloquer
+    
+    return False
+
+
 def _heartbeat_observe(index, now):
     """Skill heartbeat_pilier : surveille la fraîcheur de mise à jour des sensors énergétiques.
     
@@ -10850,7 +10962,13 @@ def _heartbeat_observe(index, now):
         
         conn = sqlite3.connect(DB_PATH)
         
-        for entity_id in _HEARTBEAT_SENSORS_PILIERS:
+        for sensor_entry in _HEARTBEAT_SENSORS_PILIERS:
+            # Unpack tuple (entity_id, guard_name) — rétrocompatible si str pure
+            if isinstance(sensor_entry, tuple) and len(sensor_entry) == 2:
+                entity_id, guard_name = sensor_entry
+            else:
+                entity_id, guard_name = sensor_entry, "none"
+            
             # Lire l'état actuel du sensor depuis l'index
             e = index.get(entity_id)
             
@@ -10945,6 +11063,13 @@ def _heartbeat_observe(index, now):
             # Seuils dynamiques basés sur la baseline apprise
             seuil_warning = p99_sec * 2 if p99_sec else 600
             seuil_critique = p99_sec * 5 if p99_sec else 1800
+            
+            # ═══ Guard contextuel (météo/horaire) ═══
+            # Étouffe les alertes pour les sensors solaires en jours nuageux/pluvieux/nuit,
+            # et pour la batterie Anker quand elle est saturée. Voir _heartbeat_guard_actif.
+            if (gap_sec > seuil_warning) and _heartbeat_guard_actif(guard_name, index, now):
+                log.debug(f"💓 heartbeat: {entity_id} gap {int(gap_sec/60)}min étouffé (guard={guard_name})")
+                continue
             
             if gap_sec > seuil_critique:
                 _alerter_si_nouveau(

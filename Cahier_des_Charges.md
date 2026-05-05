@@ -219,6 +219,50 @@ POST sécurisé pour modifier des clés de `config.json` via le deploy_server :
 
 ---
 
+## 🔌 PROCÉDURE DE CONNEXION CLAUDE → VM (05/05/2026)
+
+### Principe — Genèse du projet
+
+Le projet AssistantIA est un **agent autonome qui s'auto-administre**. Si l'opérateur (Philippe) doit SSH-er ou copier-coller pour que Claude lise du code ou applique un patch, le projet a perdu son sens.
+
+**Règle d'or** : Claude DOIT avoir la main sur la VM en permanence, sans action manuelle de Philippe au-delà de l'upload initial dans Claude Projects.
+
+### Architecture de l'accès
+
+```
+Conversation Claude
+   ├─ Project knowledge (CONNEXION_VM_SECRETS.md → secret HMAC + topic ntfy)
+   ├─ ntfy.sh (URL tunnel courante)
+   └─ bash_tool curl signé HMAC
+              ↓
+   Tunnel Cloudflare (rotatif)
+              ↓
+   deploy_server.py port 8501
+              ↓
+   /home/lolufe/assistant/ (lecture + écriture + restart)
+```
+
+### Procédure 4 étapes
+
+1. Lire `CONNEXION_VM_SECRETS.md` depuis Project knowledge → `SECRET` + `NTFY_TOPIC`
+2. `curl https://ntfy.sh/<NTFY_TOPIC>/json?poll=1&since=24h` → URL tunnel actuelle
+3. Test : `GET /status` avec `Authorization: Bearer <SECRET>` → HTTP 200
+4. Lecture/écriture des fichiers via `/read/<f>` (Bearer) et `/file` (HMAC body)
+
+### Documentation complète
+
+- **Public** (dans le repo) : `docs/CONNEXION_VM_CLAUDE.md` — procédure, endpoints, dépannage
+- **Privé** (Claude Projects uniquement, gitignoré) : `docs/CONNEXION_VM_SECRETS.md` — secret + topic + procédure de rotation
+
+### Décisions structurantes
+
+- **Pas de secret dans Git** : prévention de l'incident "API key committed in config.json.bak" d'avril 2026
+- **Pas de SSH par Philippe** : tout passe par deploy_server, sinon échec d'autonomie
+- **Tunnel Cloudflare quick** (provisoire) : sera remplacé par tunnel nommé sur sous-domaine fixe (chantier ouvert)
+- **Rotation trimestrielle du secret** recommandée
+
+---
+
 ## 💓 SKILL HEARTBEAT_PILIER — Surveillance apprenante (26/04/2026)
 
 ### Contexte
