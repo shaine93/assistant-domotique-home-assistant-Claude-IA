@@ -516,6 +516,20 @@ def init_db():
         role TEXT, contenu TEXT, created_at TEXT
     )''')
 
+    # ═══ Table d'apprentissage par feedback utilisateur (*probleme) ═══
+    # Quand l'utilisateur tape "*probleme", on capture l'incident et on génère
+    # une leçon courte qui sera injectée dans tous les prompts futurs.
+    conn.execute('''CREATE TABLE IF NOT EXISTS lecons_apprises (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        message_user TEXT,
+        reponse_bot TEXT,
+        precision_user TEXT,
+        lecon TEXT,
+        created_at TEXT,
+        usage_count INTEGER DEFAULT 0,
+        active INTEGER DEFAULT 1
+    )''')
+
     # ═══ Flag de purge historique au démarrage ═══
     # Détecte la présence de _purge_historique.flag à côté de assistant.py
     # et purge la table historique. Le flag est ensuite supprimé.
@@ -1044,6 +1058,75 @@ def get_historique(n=6):
     ).fetchall()
     conn.close()
     return list(reversed(rows))
+
+
+def get_lecons_actives(n=15):
+    """Retourne les N leçons actives les plus récentes pour injection dans le prompt.
+    Limite par défaut à 15 (≈ 800 tokens) pour rester dans le budget tokens.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            'SELECT lecon FROM lecons_apprises WHERE active=1 ORDER BY id DESC LIMIT ?',
+            (n,)
+        ).fetchall()
+        conn.close()
+        return [r[0] for r in rows if r[0]]
+    except Exception as e:
+        try:
+            log.debug(f"get_lecons_actives: {e}")
+        except Exception:
+            pass
+        return []
+
+
+def add_lecon(message_user, reponse_bot, precision_user, lecon):
+    """Stocke une nouvelle leçon. Anti-doublon par similarité simple."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        # Anti-doublon : si une leçon active très similaire existe → ne pas dupliquer
+        existantes = conn.execute(
+            "SELECT id, lecon FROM lecons_apprises WHERE active=1"
+        ).fetchall()
+        lecon_norm = lecon.lower().strip()
+        for eid, existante in existantes:
+            if existante and lecon_norm[:60] == existante.lower().strip()[:60]:
+                # Très similaire → on incrémente usage_count plutôt
+                conn.execute(
+                    "UPDATE lecons_apprises SET usage_count = usage_count + 1 WHERE id=?",
+                    (eid,)
+                )
+                conn.commit()
+                conn.close()
+                return None  # signal "déjà connue"
+        
+        # Limite 30 leçons actives — désactiver les plus anciennes/moins utilisées
+        count_active = conn.execute(
+            "SELECT COUNT(*) FROM lecons_apprises WHERE active=1"
+        ).fetchone()[0]
+        if count_active >= 30:
+            conn.execute(
+                "UPDATE lecons_apprises SET active=0 WHERE id IN ("
+                "SELECT id FROM lecons_apprises WHERE active=1 "
+                "ORDER BY usage_count ASC, id ASC LIMIT 1)"
+            )
+        
+        conn.execute(
+            "INSERT INTO lecons_apprises (message_user, reponse_bot, precision_user, lecon, created_at, active) "
+            "VALUES (?, ?, ?, ?, ?, 1)",
+            (message_user[:500], reponse_bot[:1000], precision_user[:500], lecon[:500],
+             datetime.now().isoformat())
+        )
+        conn.commit()
+        nouvelle_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.close()
+        return nouvelle_id
+    except Exception as e:
+        try:
+            log.debug(f"add_lecon: {e}")
+        except Exception:
+            pass
+        return None
 
 
 def cartographie_get(entity_id):
@@ -2220,9 +2303,17 @@ def appel_claude(message_utilisateur, contexte_ha=None):
     comportement = charger_comportement()
     # Structure du system prompt :
     # 1. Comportement (arbre de décision + interdictions + règles métier)
-    # 2. État HA (données factuelles)
-    # 3. Rappel final qui ré-ancre les instructions APRÈS le contexte (lutte "lost in the middle")
+    # 2. Leçons apprises depuis le feedback utilisateur (*probleme)
+    # 3. État HA (données factuelles)
+    # 4. Rappel final qui ré-ancre les instructions APRÈS le contexte
     system_prompt = comportement
+    
+    # ═══ Injection des leçons apprises ═══
+    _lecons = get_lecons_actives(n=15)
+    if _lecons:
+        system_prompt += "\n\n═══ LEÇONS APPRISES (corrections passées — appliquer en priorité) ═══\n"
+        for i, l in enumerate(_lecons, 1):
+            system_prompt += f"{i}. {l}\n"
     
     if contexte_ha:
         system_prompt += (

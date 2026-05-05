@@ -8930,6 +8930,121 @@ def cmd_trace():
     return rapport
 
 
+def cmd_feedback_negatif(precision=""):
+    """Commande *probleme : capture la dernière réponse, génère une leçon, la stocke.
+    
+    L'utilisateur tape "*probleme" (avec ou sans précision) après une réponse à côté.
+    Le bot :
+      1. Récupère son dernier message + la dernière réponse
+      2. Demande à Sonnet de tirer une leçon courte au format impératif
+      3. Stocke la leçon en SQLite (via add_lecon — anti-doublon, max 30 actives)
+      4. Confirme à Philippe la leçon retenue
+    
+    La leçon sera injectée automatiquement dans tous les appel_claude futurs.
+    Coût : ~500 tokens Sonnet (≈ 0.005€) une seule fois par incident.
+    """
+    try:
+        # Récupérer les 2 derniers échanges (dernier user + dernier assistant)
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            "SELECT role, contenu FROM historique ORDER BY id DESC LIMIT 6"
+        ).fetchall()
+        conn.close()
+        
+        # Le dernier est le message *probleme lui-même → on le saute
+        # On cherche : derniere reponse assistant, puis le user juste avant
+        derniere_reponse = None
+        message_user = None
+        for role, contenu in rows:
+            if role == "assistant" and not derniere_reponse:
+                # Sauter la confirmation "*probleme reçu" si elle existe
+                if contenu and not contenu.startswith("📝 Feedback"):
+                    derniere_reponse = contenu
+                    continue
+            if role == "user" and derniere_reponse and not message_user:
+                # Sauter le *probleme lui-même
+                if contenu and not contenu.lower().startswith("*probleme") and not contenu.lower().startswith("*problème"):
+                    message_user = contenu
+                    break
+        
+        if not derniere_reponse or not message_user:
+            return ("📝 Feedback enregistré mais incomplet.\n"
+                    "Pas assez d'historique pour tirer une leçon. "
+                    "Réessaie après une vraie conversation.")
+        
+        # Construire le prompt méta pour Sonnet
+        prompt_meta = f"""Tu es un système qui apprend de ses erreurs. Voici un cas où tu as mal répondu sur Telegram à Philippe (utilisateur d'un bot domotique).
+
+QUESTION DE PHILIPPE :
+{message_user[:400]}
+
+TA RÉPONSE (jugée mauvaise) :
+{derniere_reponse[:800]}
+"""
+        if precision:
+            prompt_meta += f"\nCE QUE PHILIPPE TE REPROCHE (précision) :\n{precision[:400]}\n"
+        
+        prompt_meta += """
+TÂCHE :
+Génère UNE SEULE leçon courte (max 200 caractères) au format impératif, qui :
+- Décrit en quelques mots la situation type ("Quand l'utilisateur dit X")
+- Indique ce qu'il faut faire ("fais Y") OU ne pas faire ("ne fais pas Z")
+- Est généralisable, pas spécifique à ce cas précis
+
+EXEMPLES de bonnes leçons :
+- Quand l'utilisateur dit "bonjour", réponds juste "Bonjour Philippe" et rien d'autre.
+- Quand on demande "allume X", utilise ha_call_service immédiatement, ne demande pas quelle pièce.
+- Ne propose jamais de désactiver des alertes que tu n'as pas le pouvoir de modifier.
+
+Réponds UNIQUEMENT avec la leçon, sans préambule, sans guillemets, sans markdown."""
+        
+        # Appel Sonnet (raisonnement nécessaire pour bien généraliser)
+        client = anthropic.Anthropic(api_key=CFG["anthropic_api_key"])
+        r = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt_meta}]
+        )
+        
+        # Tracker tokens
+        try:
+            t_in = r.usage.input_tokens
+            t_out = r.usage.output_tokens
+            log_token_usage(t_in, t_out)
+        except Exception:
+            pass
+        
+        # Extraire la leçon
+        lecon = ""
+        for block in r.content:
+            if block.type == "text":
+                lecon += block.text
+        lecon = lecon.strip().strip('"').strip("'").strip()
+        
+        if not lecon or len(lecon) < 20:
+            return ("📝 Feedback enregistré mais aucune leçon claire dégagée.\n"
+                    "Le cas a été noté pour réexamen ultérieur.")
+        
+        # Stocker via add_lecon (gère anti-doublon + limite 30)
+        nouvelle_id = add_lecon(message_user, derniere_reponse, precision, lecon)
+        
+        if nouvelle_id is None:
+            return (f"📝 Cas similaire déjà appris (leçon existante renforcée)\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📚 Leçon connue :\n{lecon[:300]}")
+        
+        log.info(f"📚 Nouvelle leçon #{nouvelle_id} : {lecon[:120]}")
+        
+        return (f"📝 Feedback enregistré — leçon #{nouvelle_id} créée\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📚 {lecon}\n\n"
+                f"Cette leçon sera appliquée à tous les prochains messages.")
+    
+    except Exception as e:
+        log.warning(f"cmd_feedback_negatif erreur : {e}")
+        return f"❌ Impossible d'enregistrer le feedback : {e}"
+
+
 def cmd_memoire():
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
@@ -11732,6 +11847,18 @@ def traiter_message(texte):
     if t.startswith("/"):
         t = t[1:]
     log.info(f"Message: {texte[:80]}")
+
+    # ═══ Feedback négatif "*probleme" — apprentissage par correction ═══
+    # Capture la dernière réponse jugée mauvaise par Philippe et tire une leçon.
+    # Format accepté : "*probleme" seul, ou "*probleme [détail explicatif]"
+    if t.startswith("*probleme") or t.startswith("*problème") or t.startswith("*probléme"):
+        # Extraire la précision optionnelle après le mot-clé
+        precision = ""
+        for prefix in ["*probleme", "*problème", "*probléme"]:
+            if t.startswith(prefix):
+                precision = texte.strip()[len(prefix):].strip()
+                break
+        return cmd_feedback_negatif(precision)
 
     # ✅ DICTIONNAIRE CORRIGÉ v1.5.0
     commandes = {
