@@ -516,6 +516,25 @@ def init_db():
         role TEXT, contenu TEXT, created_at TEXT
     )''')
 
+    # ═══ Flag de purge historique au démarrage ═══
+    # Détecte la présence de _purge_historique.flag à côté de assistant.py
+    # et purge la table historique. Le flag est ensuite supprimé.
+    try:
+        flag_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_purge_historique.flag")
+        if os.path.exists(flag_path):
+            conn.execute("DELETE FROM historique")
+            conn.commit()
+            os.remove(flag_path)
+            try:
+                log.info("🧹 Historique conversationnel purgé au démarrage (flag détecté)")
+            except Exception:
+                pass
+    except Exception as _e:
+        try:
+            log.debug(f"purge historique flag : {_e}")
+        except Exception:
+            pass
+
     conn.execute('''CREATE TABLE IF NOT EXISTS entites (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         entity_id TEXT UNIQUE, state TEXT, attributes TEXT, updated_at TEXT
@@ -2064,25 +2083,40 @@ def charger_comportement():
     if os.path.exists(COMPORTEMENT):
         with open(COMPORTEMENT) as f:
             return f.read()
-    return """Tu es l'assistant domotique de l'utilisateur.
-Tu réponds en français, de façon concise et professionnelle.
-Tu surveilles la maison et alertes uniquement sur les vrais problèmes.
-Priorités : énergie (PAC, solaire, prises), Zigbee, NAS, réseau.
+    return """Tu es l'assistant domotique de l'utilisateur. Réponds en français, de façon concise et professionnelle.
 
-ACTIONS HOME ASSISTANT :
-Tu as l'outil ha_call_service pour agir sur les appareils.
-Quand l'utilisateur demande une action, utilise DIRECTEMENT l'outil sans poser de question.
-NE DEMANDE JAMAIS de confirmation textuelle — le système gère la confirmation par boutons.
-NE DIS PAS que tu n'as pas accès à HA — tu as un accès réel via l'outil.
-Utilise TOUJOURS l'entity_id exact visible dans l'état HA.
-Sois CONCIS : pas de markdown, pas de blocs de code, juste l'action.
+═══ ARBRE DE DÉCISION (à suivre dans l'ordre) ═══
 
-RÈGLES ABSOLUES :
-- climate auto/heat/cool/fan_only = PAC EN SERVICE
-- climate off = PAC ARRÊTÉE
-- Onduleurs 0W la nuit = NORMAL
-- Batterie Anker < 20% = signaler
-- Automations unavailable = normal"""
+1. L'utilisateur demande une ACTION ("allume", "éteins", "ouvre", "ferme", "verrouille", "lance", "règle", "monte", "baisse"...) ?
+   → Utilise IMMÉDIATEMENT le tool ha_call_service avec l'entity_id exact (consulte la section ÉTAT HOME ASSISTANT).
+   → Si tu ne trouves pas l'entity_id directement, utilise ha_search_entities (max 1 fois) puis ha_call_service.
+   → NE DEMANDE PAS de confirmation textuelle — le système affiche un bouton de confirmation.
+
+2. L'utilisateur veut une AUTOMATISATION ("préviens-moi quand", "alerte-moi si", "envoie-moi quand")?
+   → Utilise ha_create_watch (alerte simple) ou ha_create_automation (logique complexe avec actions HA).
+
+3. L'utilisateur pose une QUESTION FACTUELLE sur la maison ("quelle est la conso ?", "il fait quelle température ?", "ma machine tourne ?") ?
+   → Réponds DIRECTEMENT en TEXTE en lisant les valeurs dans la section ÉTAT HOME ASSISTANT ci-dessous.
+   → Pas de tool call pour une simple question d'info — le contexte HA est déjà fourni.
+
+4. Cas ambigu / petite conversation ?
+   → Réponds brièvement en texte. Pas plus de 2-3 phrases.
+
+═══ INTERDICTIONS ABSOLUES ═══
+
+- NE DIS JAMAIS "je n'ai pas accès à HA" — tu as un accès réel via les tools.
+- NE DEMANDE JAMAIS à l'utilisateur de chercher des entity_id à ta place.
+- NE PROPOSE JAMAIS plusieurs options ("je peux faire X ou Y, que préférez-vous ?") — choisis et agis.
+- NE FAIS JAMAIS de markdown lourd (pas de blocs de code, pas de tableaux). Texte simple.
+- NE RÉPÈTE JAMAIS la demande de l'utilisateur dans ta réponse.
+
+═══ RÈGLES MÉTIER ═══
+
+- climate.* en mode auto/heat/cool/fan_only = PAC en service
+- climate.* en mode off = PAC arrêtée
+- sensor.ecu_* à 0W la nuit = NORMAL (onduleurs solaires)
+- sensor.solarbank_*_etat_de_charge < 20% = à signaler
+- automation.* à state="unavailable" = NORMAL pendant la sync HA"""
 
 
 def verifier_budget():
@@ -2147,28 +2181,58 @@ def appel_claude(message_utilisateur, contexte_ha=None):
     if not verifier_budget():
         return "⚠️ Budget API mensuel atteint."
 
-    comportement = charger_comportement()
-    # Instructions autonomes
-    system_prompt = comportement + """
-RÈGLES CRITIQUES :
-- Tu as accès à TOUTES les entités HA dans l'état ci-dessous. CHERCHE les entity_id toi-même.
-- NE DEMANDE JAMAIS à l'utilisateur de chercher des entités — tu as les données.
-- Pour une action simple (allumer/éteindre), utilise ha_call_service DIRECTEMENT.
-- Pour surveiller, utilise ha_create_watch DIRECTEMENT.
-- Tu es AUTONOME : l'utilisateur donne l'objectif, tu trouves les moyens.
+    # ═══ Court-circuit salutations / acquittements (0 token) ═══
+    # Évite que Claude reprenne en boucle un sujet précédent quand l'utilisateur
+    # envoie juste "bonjour" ou "merci". Réponse immédiate sans historique ni contexte.
+    _msg_strip = message_utilisateur.strip().lower().rstrip("!.?,;:")
+    _shortcuts = {
+        "bonjour":  "Bonjour Philippe 👋",
+        "salut":    "Salut Philippe 👋",
+        "hello":    "Hello Philippe 👋",
+        "hi":       "Hi Philippe 👋",
+        "coucou":   "Coucou Philippe 👋",
+        "bonsoir":  "Bonsoir Philippe 👋",
+        "merci":    "De rien.",
+        "thanks":   "De rien.",
+        "thx":      "De rien.",
+        "ok":       "👍",
+        "okay":     "👍",
+        "d'accord": "👍",
+        "daccord":  "👍",
+    }
+    if _msg_strip in _shortcuts:
+        reponse = _shortcuts[_msg_strip]
+        # Purger l'historique conversationnel — un shortcut signifie "on repart à zéro"
+        # Évite que Claude continue une tâche précédente non résolue.
+        try:
+            _conn = sqlite3.connect(DB_PATH)
+            _n = _conn.execute("SELECT COUNT(*) FROM historique").fetchone()[0]
+            _conn.execute("DELETE FROM historique")
+            _conn.commit()
+            _conn.close()
+            log.info(f"💬 shortcut '{_msg_strip}' → purge historique ({_n} msgs) + réponse 0 token")
+        except Exception as _e:
+            log.debug(f"shortcut purge: {_e}")
+        add_historique("user", message_utilisateur)
+        add_historique("assistant", reponse)
+        return reponse
 
-AUTOMATISATIONS — MÉTHODE OBLIGATOIRE :
-1. D'abord, utilise ha_search_entities pour trouver les entités liées à la demande
-2. Avec les résultats, utilise ha_create_automation pour créer l'automatisation
-3. Le système affiche un résumé avec boutons Valider/Modifier/Annuler
-- NE POSE JAMAIS DE QUESTIONS. NE DEMANDE JAMAIS DE PRÉCISIONS. AGIS.
-- Fonctionne avec TOUTES les intégrations HA : Anker, Shelly, Zigbee, Tuya, etc.
-"""
+    comportement = charger_comportement()
+    # Structure du system prompt :
+    # 1. Comportement (arbre de décision + interdictions + règles métier)
+    # 2. État HA (données factuelles)
+    # 3. Rappel final qui ré-ancre les instructions APRÈS le contexte (lutte "lost in the middle")
+    system_prompt = comportement
+    
     if contexte_ha:
-        if False:
-            system_prompt += "\n\n=== HOME ASSISTANT ===\nUtilise ha_search_entities pour trouver les entités. Ne cherche PAS dans un état global."
-        else:
-            system_prompt += f"\n\n=== ÉTAT HOME ASSISTANT ===\n{contexte_ha}"
+        system_prompt += (
+            "\n\n═══ ÉTAT HOME ASSISTANT (données factuelles) ═══\n"
+            + contexte_ha
+            + "\n\n═══ RAPPEL FINAL — NE PAS IGNORER ═══\n"
+            "Tu viens de lire l'état HA. Maintenant : applique l'arbre de décision défini en début de prompt.\n"
+            "Action demandée → ha_call_service. Surveillance → ha_create_watch. Question d'info → réponse texte concise.\n"
+            "Ne pose pas de questions, choisis et agis."
+        )
 
     historique = get_historique(6)
     messages = [{"role": r, "content": c} for r, c in historique]
@@ -2176,14 +2240,28 @@ AUTOMATISATIONS — MÉTHODE OBLIGATOIRE :
 
     try:
         client = anthropic.Anthropic(api_key=CFG["anthropic_api_key"])
-        # Sonnet pour requêtes complexes
-        _kw = ["automatisation", "automation", "crée une", "créer", "configure",
-            "délestage", "scénario", "routine", "quand la batterie",
-            "si la température", "programme un", "yaml", "script ha"]
-        _use_sonnet = any(k in message_utilisateur.lower() for k in _kw)
+        # ═══ Routing modèle ═══
+        # Sonnet pour : créations d'automatisations, scénarios, raisonnements multi-étapes,
+        # analyses, requêtes longues. Haiku pour : actions HA simples, questions factuelles.
+        _msg_lower = message_utilisateur.lower()
+        _kw_sonnet = [
+            # Création / configuration
+            "automatisation", "automation", "crée une", "créer", "configure", "configurer",
+            "délestage", "scénario", "routine", "programme un", "yaml", "script ha",
+            # Conditionnels complexes
+            "quand la batterie", "si la température", "quand le solaire", "si la conso",
+            "quand l'onduleur", "si la pac", "lorsque",
+            # Analyses
+            "analyse", "compare", "explique", "pourquoi", "combien", "calcule",
+            "prévois", "prévision", "diagnostic", "optimise", "recommande",
+        ]
+        _use_sonnet = (
+            any(k in _msg_lower for k in _kw_sonnet)
+            or len(message_utilisateur) > 200  # Requête longue → Sonnet
+        )
         _model = "claude-sonnet-4-6" if _use_sonnet else "claude-haiku-4-5-20251001"
-        if False:
-            log.info(f"🧠 Sonnet activé pour: {message_utilisateur[:50]}")
+        if _use_sonnet:
+            log.info(f"🧠 Sonnet activé pour: {message_utilisateur[:80]}")
         r = client.messages.create(
             model=_model,
             max_tokens=2000 if _use_sonnet else 1000,
@@ -2193,7 +2271,8 @@ AUTOMATISATIONS — MÉTHODE OBLIGATOIRE :
                 "cache_control": {"type": "ephemeral"}
             }],
             messages=messages,
-            tools=HA_TOOLS
+            tools=HA_TOOLS,
+            tool_choice={"type": "auto"}  # Force le modèle à considérer activement les tools
         )
         t_in = r.usage.input_tokens
         t_out = r.usage.output_tokens

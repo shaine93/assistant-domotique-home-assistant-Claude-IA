@@ -8874,6 +8874,62 @@ def cmd_logs():
         return f"❌ Logs: {e}"
 
 
+def cmd_trace():
+    """Trace du dernier échange Claude : modèle, tokens, tools, anomalies.
+    Idéal pour comprendre pourquoi le bot a répondu bizarrement."""
+    try:
+        with open(LOG_PATH) as f:
+            lignes = f.readlines()
+    except Exception as e:
+        return f"❌ Logs: {e}"
+    
+    # Trouver le dernier "Message: " (= dernier message utilisateur)
+    idx_dernier = -1
+    for i in range(len(lignes) - 1, -1, -1):
+        if "[INFO] Message:" in lignes[i]:
+            idx_dernier = i
+            break
+    
+    if idx_dernier < 0:
+        return "🔍 TRACE\nAucun message utilisateur trouvé dans les logs."
+    
+    # Capturer les lignes depuis ce message
+    bloc = lignes[idx_dernier:idx_dernier + 200]
+    
+    interessant = []
+    for ligne in bloc:
+        l = ligne.rstrip()
+        if any(k in l for k in [
+            "[INFO] Message:", "💬 shortcut", "🧠 Sonnet activé",
+            "CONTEXTE→HAIKU", "Tokens: in=", "🧹",
+            "[ERROR]", "[WARNING]", "Search loop",
+            "Alerte créée", "ha_call_service", "ha_create_watch",
+            "ha_create_automation", "AUTOMATISATION PROPOSÉE", "📨 [",
+        ]):
+            try:
+                parts = l.split("] ", 2)
+                if len(parts) >= 3:
+                    interessant.append(parts[0] + "] " + parts[1] + "] " + parts[2][:200])
+                else:
+                    interessant.append(l[:280])
+            except Exception:
+                interessant.append(l[:280])
+    
+    if not interessant:
+        return f"🔍 TRACE\nMessage trouvé mais aucune trace pertinente.\n{lignes[idx_dernier].strip()[:200]}"
+    
+    if len(interessant) > 25:
+        interessant = interessant[:12] + ["..."] + interessant[-12:]
+    
+    rapport = "🔍 TRACE — Dernier échange Claude\n━━━━━━━━━━━━━━━━━━━━\n"
+    rapport += "\n".join(interessant)
+    
+    if len(rapport) > 3800:
+        rapport = rapport[:3800] + "\n[…tronqué]"
+    
+    return rapport
+
+
 def cmd_memoire():
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
@@ -11690,6 +11746,7 @@ def traiter_message(texte):
         "budget": cmd_budget,
         "heartbeat": cmd_heartbeat,
         "debug": cmd_debug,
+        "trace": cmd_trace,
         "logs": cmd_logs,
         "mémoire": cmd_memoire, "memoire": cmd_memoire,
         "scan": cmd_scan,
