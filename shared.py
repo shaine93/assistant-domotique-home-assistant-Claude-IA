@@ -530,6 +530,23 @@ def init_db():
         active INTEGER DEFAULT 1
     )''')
 
+    # ═══ Table de trace structurée — vrai debug observable via /cerveau ═══
+    # Chaque tour Telegram produit une trace complète. Permet de voir d'un coup
+    # ce qui s'est passé : modèle, leçons appliquées, tools, tokens, anomalies.
+    conn.execute('''CREATE TABLE IF NOT EXISTS tour_trace (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT,
+        message_user TEXT,
+        contexte_taille INTEGER,
+        nb_lecons_injectees INTEGER,
+        modele TEXT,
+        tools_appeles TEXT,
+        reponse_resume TEXT,
+        tokens_in INTEGER,
+        tokens_out INTEGER,
+        anomalies TEXT
+    )''')
+
     # ═══ Flag de purge historique au démarrage ═══
     # Détecte la présence de _purge_historique.flag à côté de assistant.py
     # et purge la table historique. Le flag est ensuite supprimé.
@@ -1127,6 +1144,76 @@ def add_lecon(message_user, reponse_bot, precision_user, lecon):
         except Exception:
             pass
         return None
+
+
+# ═══ Trace structurée des tours Telegram (vrai debug) ═══
+
+def trace_save(message_user, contexte_taille=0, nb_lecons=0, modele="",
+               tools="", reponse_resume="", tokens_in=0, tokens_out=0,
+               anomalies=""):
+    """Enregistre un tour complet en SQLite. Trim auto à 200 dernières."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT INTO tour_trace (ts, message_user, contexte_taille, nb_lecons_injectees, "
+            "modele, tools_appeles, reponse_resume, tokens_in, tokens_out, anomalies) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (datetime.now().isoformat(), str(message_user)[:500], contexte_taille, nb_lecons,
+             modele, str(tools)[:300],
+             str(reponse_resume)[:500], tokens_in, tokens_out, str(anomalies)[:300])
+        )
+        conn.commit()
+        # Trim : ne garder que 200 dernières
+        conn.execute("DELETE FROM tour_trace WHERE id NOT IN ("
+                     "SELECT id FROM tour_trace ORDER BY id DESC LIMIT 200)")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        try:
+            log.debug(f"trace_save: {e}")
+        except Exception:
+            pass
+
+
+def trace_get_dernier():
+    """Retourne le dernier tour tracé sous forme de dict, ou None."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute(
+            "SELECT ts, message_user, contexte_taille, nb_lecons_injectees, "
+            "modele, tools_appeles, reponse_resume, tokens_in, tokens_out, anomalies "
+            "FROM tour_trace ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        if not row:
+            return None
+        return {
+            "ts": row[0], "message_user": row[1], "contexte_taille": row[2],
+            "nb_lecons": row[3], "modele": row[4],
+            "tools": row[5], "reponse": row[6],
+            "tokens_in": row[7], "tokens_out": row[8], "anomalies": row[9]
+        }
+    except Exception as e:
+        try:
+            log.debug(f"trace_get_dernier: {e}")
+        except Exception:
+            pass
+        return None
+
+
+def trace_get_recents(n=10):
+    """Retourne les N derniers tours tracés."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            "SELECT ts, message_user, modele, tools_appeles, reponse_resume, "
+            "tokens_in, tokens_out, anomalies FROM tour_trace "
+            "ORDER BY id DESC LIMIT ?", (n,)
+        ).fetchall()
+        conn.close()
+        return rows
+    except Exception:
+        return []
 
 
 def cartographie_get(entity_id):
@@ -2298,6 +2385,11 @@ def appel_claude(message_utilisateur, contexte_ha=None):
             log.debug(f"shortcut purge: {_e}")
         add_historique("user", message_utilisateur)
         add_historique("assistant", reponse)
+        try:
+            trace_save(message_utilisateur, modele="shortcut",
+                       reponse_resume=reponse, tokens_in=0, tokens_out=0)
+        except Exception:
+            pass
         return reponse
 
     comportement = charger_comportement()
@@ -2491,6 +2583,17 @@ def appel_claude(message_utilisateur, contexte_ha=None):
             ]
             telegram_send_buttons(confirm_msg, boutons)
             add_historique("assistant", f"[ACTION] {action_label} {entity_short}")
+            try:
+                trace_save(message_utilisateur,
+                           contexte_taille=len(contexte_ha or ""),
+                           nb_lecons=len(_lecons) if _lecons else 0,
+                           modele=_model,
+                           tools=f"ha_call_service: {entity_id}",
+                           reponse_resume=f"[ACTION] {action_label} {entity_short}",
+                           tokens_in=t_in + t_cache_read + t_cache_write,
+                           tokens_out=t_out)
+            except Exception:
+                pass
             return ""  # Déjà envoyé via buttons
 
         # ═══ WATCH — Créer une alerte automatique ═══
@@ -2625,11 +2728,37 @@ def appel_claude(message_utilisateur, contexte_ha=None):
                     {"text": "❌ Annuler", "callback_data": "auto_cancel"},
                 ])
                 add_historique("assistant", msg)
+                try:
+                    trace_save(message_utilisateur,
+                               contexte_taille=len(contexte_ha or ""),
+                               nb_lecons=len(_lecons) if _lecons else 0,
+                               modele=_model,
+                               tools="ha_create_automation",
+                               reponse_resume="[AUTOMATION proposée]",
+                               tokens_in=t_in + t_cache_read + t_cache_write,
+                               tokens_out=t_out)
+                except Exception:
+                    pass
                 return ""
             except Exception as e:
                 log.error(f"Automation pending: {e}")
 
                 add_historique("assistant", texte_reponse)
+        try:
+            _tools_used = []
+            if action_demandee: _tools_used.append("ha_call_service")
+            if watch_demandee: _tools_used.append("ha_create_watch")
+            if automation_demandee: _tools_used.append("ha_create_automation")
+            trace_save(message_utilisateur,
+                       contexte_taille=len(contexte_ha or ""),
+                       nb_lecons=len(_lecons) if _lecons else 0,
+                       modele=_model,
+                       tools=",".join(_tools_used) if _tools_used else "texte",
+                       reponse_resume=texte_reponse[:300] if texte_reponse else "(vide)",
+                       tokens_in=t_in + t_cache_read + t_cache_write,
+                       tokens_out=t_out)
+        except Exception:
+            pass
         return texte_reponse
     except anthropic.AuthenticationError:
         return "❌ Clé API Anthropic invalide"

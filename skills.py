@@ -8986,15 +8986,27 @@ TA RÉPONSE (jugée mauvaise) :
         
         prompt_meta += """
 TÂCHE :
-Génère UNE SEULE leçon courte (max 200 caractères) au format impératif, qui :
-- Décrit en quelques mots la situation type ("Quand l'utilisateur dit X")
-- Indique ce qu'il faut faire ("fais Y") OU ne pas faire ("ne fais pas Z")
-- Est généralisable, pas spécifique à ce cas précis
+Génère UNE SEULE leçon courte (max 200 caractères) au format impératif. La leçon doit être :
+
+1. GÉNÉRALISABLE — pas spécifique à ce cas, mais applicable à toute situation similaire
+2. ACTIONNABLE — décrit un comportement concret à adopter ou à éviter
+3. ANCRÉE DANS LE RÉEL — si l'erreur vient d'une affirmation non vérifiée dans HA, la leçon doit imposer la vérification factuelle (interroger /api/states ou ha_search_entities) AVANT d'affirmer ou agir
+4. ÉVOLUTIVE — ne contient JAMAIS de fait observable de HA (ex: "il n'y a pas de lumière dans le salon"), uniquement des règles de comportement (ex: "vérifier dans HA si l'entité existe avant d'affirmer son absence")
+
+FORMAT IMPÉRATIF :
+"Quand <situation>, <action à faire> / <action à éviter>"
 
 EXEMPLES de bonnes leçons :
-- Quand l'utilisateur dit "bonjour", réponds juste "Bonjour Philippe" et rien d'autre.
-- Quand on demande "allume X", utilise ha_call_service immédiatement, ne demande pas quelle pièce.
+- Quand on demande une action, vérifie l'existence des entités dans HA avant d'affirmer qu'elles n'existent pas.
+- Quand l'utilisateur dit "bonjour", réponds en 1 ligne et n'enchaîne pas sur des sujets précédents.
+- Quand on demande "allume X", utilise ha_call_service immédiatement sans demander quelle pièce.
 - Ne propose jamais de désactiver des alertes que tu n'as pas le pouvoir de modifier.
+- N'affirme jamais qu'une fonctionnalité existe sans avoir vérifié sa présence côté HA.
+
+EXEMPLES de MAUVAISES leçons (à NE PAS produire) :
+- "Il n'y a pas de lumière dans le salon de Philippe" (fait observable, change si Hue installée demain)
+- "Philippe a deux prises au salon" (fait HA, périmé dès qu'il en ajoute/retire)
+- "La batterie Anker est à 13%" (état instantané, pas une règle)
 
 Réponds UNIQUEMENT avec la leçon, sans préambule, sans guillemets, sans markdown."""
         
@@ -9043,6 +9055,82 @@ Réponds UNIQUEMENT avec la leçon, sans préambule, sans guillemets, sans markd
     except Exception as e:
         log.warning(f"cmd_feedback_negatif erreur : {e}")
         return f"❌ Impossible d'enregistrer le feedback : {e}"
+
+
+def cmd_cerveau():
+    """Vue d'ensemble de ce que le bot a appris : leçons + dernier tour tracé.
+    
+    Sorties (en 1 message Telegram) :
+      📚 Leçons apprises actives (les N dernières)
+      📊 Dernier tour : modèle, tools, tokens, anomalies
+      🩺 Stats globales (nb tours, tokens cumulés, leçons totales)
+    """
+    out = ["🧠 CERVEAU DU BOT", "━━━━━━━━━━━━━━━━━━━━"]
+    
+    try:
+        # 1. Leçons actives
+        conn = sqlite3.connect(DB_PATH)
+        lecons_rows = conn.execute(
+            "SELECT id, lecon, usage_count, created_at FROM lecons_apprises "
+            "WHERE active=1 ORDER BY id DESC LIMIT 12"
+        ).fetchall()
+        nb_lecons_total = conn.execute(
+            "SELECT COUNT(*) FROM lecons_apprises WHERE active=1"
+        ).fetchone()[0]
+        conn.close()
+        
+        out.append(f"\n📚 LEÇONS APPRISES ({nb_lecons_total} actives)")
+        if not lecons_rows:
+            out.append("  (aucune — utilise *probleme pour m'apprendre)")
+        else:
+            for lid, lecon, usage, _ in lecons_rows:
+                marker = f"×{usage}" if usage > 0 else ""
+                out.append(f"  #{lid} {marker} {lecon[:160]}")
+    except Exception as e:
+        out.append(f"  ❌ erreur lecture leçons : {e}")
+    
+    try:
+        # 2. Dernier tour
+        dernier = trace_get_dernier()
+        out.append("\n📊 DERNIER TOUR")
+        if not dernier:
+            out.append("  (aucune trace)")
+        else:
+            ts_court = dernier["ts"][:19].replace("T", " ")
+            out.append(f"  ⏰ {ts_court}")
+            out.append(f"  📥 {(dernier['message_user'] or '')[:80]}")
+            out.append(f"  🤖 modèle : {dernier['modele']}")
+            out.append(f"  🔧 tools : {dernier['tools'] or 'aucun'}")
+            out.append(f"  📝 réponse : {(dernier['reponse'] or '')[:120]}")
+            out.append(f"  💰 tokens : {dernier['tokens_in']}↗ {dernier['tokens_out']}↘")
+            out.append(f"  📚 leçons appliquées : {dernier['nb_lecons']}")
+            if dernier['anomalies']:
+                out.append(f"  ⚠️ {dernier['anomalies'][:120]}")
+    except Exception as e:
+        out.append(f"  ❌ erreur trace : {e}")
+    
+    try:
+        # 3. Stats globales
+        conn = sqlite3.connect(DB_PATH)
+        nb_tours = conn.execute("SELECT COUNT(*) FROM tour_trace").fetchone()[0]
+        sums = conn.execute(
+            "SELECT COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0) FROM tour_trace"
+        ).fetchone()
+        nb_lecons_tot = conn.execute(
+            "SELECT COUNT(*) FROM lecons_apprises"
+        ).fetchone()[0]
+        conn.close()
+        out.append("\n🩺 STATS")
+        out.append(f"  Tours tracés : {nb_tours} (200 max retenus)")
+        out.append(f"  Tokens cumulés : {sums[0]}↗ {sums[1]}↘")
+        out.append(f"  Leçons (actives + archivées) : {nb_lecons_tot}")
+    except Exception as e:
+        out.append(f"  ❌ erreur stats : {e}")
+    
+    rapport = "\n".join(out)
+    if len(rapport) > 3800:
+        rapport = rapport[:3800] + "\n[…tronqué]"
+    return rapport
 
 
 def cmd_memoire():
@@ -11874,6 +11962,7 @@ def traiter_message(texte):
         "heartbeat": cmd_heartbeat,
         "debug": cmd_debug,
         "trace": cmd_trace,
+        "cerveau": cmd_cerveau,
         "logs": cmd_logs,
         "mémoire": cmd_memoire, "memoire": cmd_memoire,
         "scan": cmd_scan,
