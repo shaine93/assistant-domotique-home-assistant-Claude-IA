@@ -98,6 +98,10 @@ __all__ = [
     "transcrire_vocal",
     "_wizard_step",
     "add_historique",
+    "add_lecon",
+    "anomalie_log",
+    "anomalies_groupees",
+    "anomalies_recentes",
     "appareil_get",
     "appareil_set",
     "appel_claude",
@@ -123,6 +127,7 @@ __all__ = [
     "generer_code_auth",
     "get_economies_mois",
     "get_historique",
+    "get_lecons_actives",
     "get_token_usage",
     "ha_est_jour",
     "ha_get",
@@ -152,6 +157,9 @@ __all__ = [
     "telegram_send",
     "telegram_send_buttons",
     "telegram_send_photo",
+    "trace_get_dernier",
+    "trace_get_recents",
+    "trace_save",
     "verifier_budget",
     "verifier_code",
     "zigbee_absence_creer",
@@ -545,6 +553,24 @@ def init_db():
         tokens_in INTEGER,
         tokens_out INTEGER,
         anomalies TEXT
+    )''')
+
+    # ═══ Table d'anomalies auto-détectées — pipeline de correction continu ═══
+    # Le bot détecte ses propres défaillances et les enregistre :
+    #   info     : événements à surveiller (pas urgents)
+    #   warning  : comportements anormaux (à corriger sous quelques jours)
+    #   critique : bugs bloquants (action immédiate recommandée)
+    # Une notification Telegram est déclenchée si seuil dépassé (anti-flood : 1 par type / 10 min).
+    conn.execute('''CREATE TABLE IF NOT EXISTS anomalies_auto (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT,
+        type TEXT,
+        severite TEXT,
+        message_user TEXT,
+        details TEXT,
+        modele TEXT,
+        tokens_in INTEGER DEFAULT 0,
+        tokens_out INTEGER DEFAULT 0
     )''')
 
     # ═══ Flag de purge historique au démarrage ═══
@@ -1209,6 +1235,205 @@ def trace_get_recents(n=10):
             "SELECT ts, message_user, modele, tools_appeles, reponse_resume, "
             "tokens_in, tokens_out, anomalies FROM tour_trace "
             "ORDER BY id DESC LIMIT ?", (n,)
+        ).fetchall()
+        conn.close()
+        return rows
+    except Exception:
+        return []
+
+
+# ═══ Détection d'anomalies — pipeline de correction continu ═══
+
+# Sévérités acceptées
+_SEVERITES = ("info", "warning", "critique")
+
+# Anti-flood : dernière notification Telegram par type d'anomalie
+_ANOMALIE_LAST_NOTIF = {}
+
+# Anti-flood global : 5 min entre 2 notifs du même type (option A)
+_ANTIFLOOD_SEC = 300
+
+# Seuils déclenchant la notification Telegram pour les WARNINGS (cascade détection).
+# Les CRITIQUES sont notifiées dès la 1ère occurrence (non listées ici).
+# Format : {type_anomalie: (nb_min, fenetre_minutes)}
+_SEUILS_NOTIF = {
+    "tool_crash":         (1, 1),    # 1 crash → ping immédiat
+    "boucle_tool":        (1, 1),    # 1 boucle → ping
+    "api_timeout":        (2, 10),   # 2 timeouts en 10 min → ping
+    "api_ratelimit":      (2, 10),   # 2 rate limits en 10 min → ping
+    "api_bad_request":    (2, 10),
+    "reponse_vide":       (3, 10),   # 3 réponses vides en 10 min → ping
+    "tokens_excessifs":   (5, 30),   # 5 messages très chers en 30 min
+    "reponse_longue":     (5, 30),   # 5 bavardages en 30 min
+    "search_overflow":    (2, 10),   # 2 recherches en boucle en 10 min
+    "exception_inconnue": (1, 1),    # bug Python non typé → ping immédiat
+    "api_authentic":      (1, 1),    # 1 auth error → ping immédiat
+    "api_retry_failed":   (1, 1),    # retry échoué → ping immédiat
+}
+
+
+def anomalie_log(type_anomalie, severite, details="", message_user="",
+                 modele="", tokens_in=0, tokens_out=0):
+    """Enregistre une anomalie auto-détectée. Déclenche notif Telegram selon politique.
+    
+    Politique (option A) :
+      - Toute anomalie de sévérité 'critique' → notification immédiate (anti-flood 5 min/type)
+      - 'warning' → notification si seuil de cascade dépassé
+      - 'info' → silencieux (visible via /diagnostic)
+    """
+    if severite not in _SEVERITES:
+        severite = "info"
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT INTO anomalies_auto (ts, type, severite, message_user, details, "
+            "modele, tokens_in, tokens_out) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (datetime.now().isoformat(), type_anomalie, severite,
+             str(message_user)[:300], str(details)[:500], modele, tokens_in, tokens_out)
+        )
+        conn.commit()
+        # Trim : 500 dernières anomalies
+        conn.execute("DELETE FROM anomalies_auto WHERE id NOT IN ("
+                     "SELECT id FROM anomalies_auto ORDER BY id DESC LIMIT 500)")
+        conn.commit()
+        conn.close()
+        try:
+            log.warning(f"⚠️ anomalie [{severite}] {type_anomalie} : {details[:120]}")
+        except Exception:
+            pass
+        # Notification Telegram selon politique
+        _verifier_seuil_notification(type_anomalie, severite, details, message_user,
+                                     modele, tokens_in, tokens_out)
+    except Exception as e:
+        try:
+            log.debug(f"anomalie_log: {e}")
+        except Exception:
+            pass
+
+
+def _verifier_seuil_notification(type_anomalie, severite, details="", message_user="",
+                                 modele="", tokens_in=0, tokens_out=0):
+    """Politique de notification Telegram (option A) :
+    
+    - CRITIQUE : notification immédiate (1ère occurrence) avec anti-flood 5 min/type
+    - WARNING  : notification si seuil de cascade dépassé (cf _SEUILS_NOTIF)
+    - INFO     : silencieux
+    
+    Format enrichi : type, sévérité, occurrences récentes, message user, modèle,
+    tokens, détail technique, action recommandée.
+    """
+    try:
+        from datetime import datetime, timedelta
+        
+        # Filtre 1 : ignorer les info
+        if severite == "info":
+            return
+        
+        # Filtre 2 : appliquer seuils pour warnings, ou notifier directement pour critiques
+        if severite == "critique":
+            nb_min, fenetre_min = (1, 1)  # critique = ping dès la 1ère occurrence
+        else:
+            seuil = _SEUILS_NOTIF.get(type_anomalie, (3, 10))  # défaut warning
+            nb_min, fenetre_min = seuil
+        
+        # Compter occurrences récentes
+        seuil_ts = (datetime.now() - timedelta(minutes=fenetre_min)).isoformat()
+        conn = sqlite3.connect(DB_PATH)
+        nb_occ = conn.execute(
+            "SELECT COUNT(*) FROM anomalies_auto WHERE type=? AND ts >= ?",
+            (type_anomalie, seuil_ts)
+        ).fetchone()[0]
+        conn.close()
+        
+        if nb_occ < nb_min:
+            return  # Sous le seuil
+        
+        # Anti-flood : 5 min entre 2 notifs même type
+        last_notif_ts = _ANOMALIE_LAST_NOTIF.get(type_anomalie)
+        if last_notif_ts:
+            if (datetime.now() - last_notif_ts).total_seconds() < _ANTIFLOOD_SEC:
+                return
+        _ANOMALIE_LAST_NOTIF[type_anomalie] = datetime.now()
+        
+        # ═══ Construction du message enrichi ═══
+        emoji_sev = {"critique": "🔴", "warning": "🟡", "info": "🔵"}.get(severite, "⚪")
+        
+        msg_parts = []
+        msg_parts.append("⚠️ ERREUR CLAUDE")
+        msg_parts.append("━━━━━━━━━━━━━━━━━━━━")
+        msg_parts.append(f"{emoji_sev} Type : {type_anomalie} ({severite})")
+        if nb_occ > 1:
+            msg_parts.append(f"📊 Occurrences : {nb_occ} en {fenetre_min} min")
+        
+        if message_user:
+            msg_user_short = str(message_user).strip().replace("\n", " ")[:120]
+            msg_parts.append("")
+            msg_parts.append(f"🗨️ Ton message :")
+            msg_parts.append(f'"{msg_user_short}"')
+        
+        if modele:
+            msg_parts.append("")
+            msg_parts.append(f"🤖 Modèle : {modele}")
+        
+        if tokens_in or tokens_out:
+            msg_parts.append(f"⏱️ Tokens : {tokens_in}↗ {tokens_out}↘")
+        
+        if details:
+            details_clean = str(details).strip().replace("\n", " ")[:300]
+            msg_parts.append("")
+            msg_parts.append("📋 Détail technique :")
+            msg_parts.append(details_clean)
+        
+        msg_parts.append("")
+        msg_parts.append("💡 /diagnostic pour patches suggérés")
+        
+        message = "\n".join(msg_parts)
+        if len(message) > 3800:
+            message = message[:3800] + "\n[…tronqué]"
+        
+        try:
+            telegram_send(message)
+        except Exception as _e:
+            try:
+                log.debug(f"notif anomalie échouée: {_e}")
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            log.debug(f"_verifier_seuil_notification: {e}")
+        except Exception:
+            pass
+
+
+def anomalies_recentes(n=50, depuis_heures=24):
+    """Retourne les N anomalies récentes des dernières X heures."""
+    try:
+        from datetime import datetime, timedelta
+        seuil_ts = (datetime.now() - timedelta(hours=depuis_heures)).isoformat()
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            "SELECT ts, type, severite, message_user, details, modele, tokens_in, tokens_out "
+            "FROM anomalies_auto WHERE ts >= ? ORDER BY id DESC LIMIT ?",
+            (seuil_ts, n)
+        ).fetchall()
+        conn.close()
+        return rows
+    except Exception:
+        return []
+
+
+def anomalies_groupees(depuis_heures=24):
+    """Retourne les anomalies groupées par type avec count, dernière occurrence, sévérité max."""
+    try:
+        from datetime import datetime, timedelta
+        seuil_ts = (datetime.now() - timedelta(hours=depuis_heures)).isoformat()
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            "SELECT type, COUNT(*) as nb, MAX(ts) as derniere_ts, "
+            "GROUP_CONCAT(DISTINCT severite) as severites "
+            "FROM anomalies_auto WHERE ts >= ? "
+            "GROUP BY type ORDER BY nb DESC",
+            (seuil_ts,)
         ).fetchall()
         conn.close()
         return rows
@@ -2478,6 +2703,12 @@ def appel_claude(message_utilisateur, contexte_ha=None):
                 _search_count = getattr(appel_claude, '_search_count', 0) + 1
                 if _search_count > 2:
                     log.warning(f"⚠️ Search loop détecté ({_search_count} appels) — arrêt")
+                    try:
+                        anomalie_log("search_overflow", "warning",
+                                     details=f"{_search_count} recherches consécutives, arrêt forcé",
+                                     message_user=message_utilisateur, modele=_model)
+                    except Exception:
+                        pass
                     texte_reponse = "Je n'ai pas trouvé les entités nécessaires. Reformulez votre demande."
                     break
                 appel_claude._search_count = _search_count
@@ -2759,12 +2990,53 @@ def appel_claude(message_utilisateur, contexte_ha=None):
                        tokens_out=t_out)
         except Exception:
             pass
+        # ═══ Détection passive d'anomalies sur la réponse texte ═══
+        try:
+            _tokens_total = (t_in + t_cache_read + t_cache_write) if "t_in" in dir() else 0
+            _tokens_out_v = t_out if "t_out" in dir() else 0
+            
+            # 1. Réponse vide alors qu'aucun tool n'a été appelé
+            _aucun_tool = (not action_demandee and not watch_demandee and not automation_demandee)
+            if _aucun_tool and (not texte_reponse or not texte_reponse.strip()):
+                anomalie_log("reponse_vide", "warning",
+                             details="Réponse vide sans tool ni texte",
+                             message_user=message_utilisateur, modele=_model,
+                             tokens_in=_tokens_total, tokens_out=_tokens_out_v)
+            
+            # 2. Réponse trop longue (probable bavardage)
+            if texte_reponse and len(texte_reponse) > 1500:
+                anomalie_log("reponse_longue", "info",
+                             details=f"Réponse de {len(texte_reponse)} caractères (seuil 1500)",
+                             message_user=message_utilisateur, modele=_model,
+                             tokens_in=_tokens_total, tokens_out=_tokens_out_v)
+            
+            # 3. Tokens output excessifs (>3000 = très bavard)
+            if _tokens_out_v > 3000:
+                anomalie_log("tokens_excessifs", "warning",
+                             details=f"{_tokens_out_v} tokens out (seuil 3000)",
+                             message_user=message_utilisateur, modele=_model,
+                             tokens_in=_tokens_total, tokens_out=_tokens_out_v)
+        except Exception:
+            pass
         return texte_reponse
     except anthropic.AuthenticationError:
+        try:
+            anomalie_log("api_authentic", "critique",
+                         details="Clé API Anthropic invalide ou expirée",
+                         message_user=message_utilisateur)
+        except Exception:
+            pass
         return "❌ Clé API Anthropic invalide"
     except anthropic.BadRequestError as e:
         # Erreur de schéma tools → retry sans tools
         log.warning(f"⚠️ Claude BadRequest (retry sans tools): {str(e)[:100]}")
+        try:
+            anomalie_log("api_bad_request", "warning",
+                         details=f"BadRequest: {str(e)[:200]}",
+                         message_user=message_utilisateur,
+                         modele=_model if "_model" in dir() else "?")
+        except Exception:
+            pass
         try:
             r2 = client.messages.create(
                 model=_model,
@@ -2779,15 +3051,41 @@ def appel_claude(message_utilisateur, contexte_ha=None):
             return texte_retry
         except Exception as e2:
             log.error(f"❌ Claude retry failed: {e2}")
+            try:
+                anomalie_log("api_retry_failed", "critique",
+                             details=f"Retry sans tools échoué : {str(e2)[:200]}",
+                             message_user=message_utilisateur)
+            except Exception:
+                pass
             return "Je n'ai pas pu traiter cette demande. Réessayez en reformulant."
     except anthropic.RateLimitError:
         log.warning("⏳ Rate limit API — réessayez dans 30 secondes.")
+        try:
+            anomalie_log("api_ratelimit", "warning",
+                         details="Rate limit Anthropic atteint",
+                         message_user=message_utilisateur)
+        except Exception:
+            pass
         return "⏳ L'API est surchargée. Réessayez dans 30 secondes."
     except anthropic.APIError as e:
         log.error(f"❌ Claude API: {e}")
+        try:
+            err_str = str(e)[:200]
+            sev = "critique" if "timeout" in err_str.lower() or "5" in err_str[:3] else "warning"
+            type_ = "api_timeout" if "timeout" in err_str.lower() else "api_error"
+            anomalie_log(type_, sev, details=err_str,
+                         message_user=message_utilisateur)
+        except Exception:
+            pass
         return "⚠️ Erreur temporaire. Réessayez."
     except Exception as e:
         log.error(f"❌ Claude: {e}")
+        try:
+            anomalie_log("exception_inconnue", "critique",
+                         details=f"{type(e).__name__}: {str(e)[:200]}",
+                         message_user=message_utilisateur)
+        except Exception:
+            pass
         return "Je n'ai pas pu traiter cette demande. Réessayez."
 
 def transcrire_vocal(file_id):

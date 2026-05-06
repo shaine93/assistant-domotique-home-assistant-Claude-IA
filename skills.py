@@ -9121,11 +9121,142 @@ def cmd_cerveau():
         ).fetchone()[0]
         conn.close()
         out.append("\n🩺 STATS")
-        out.append(f"  Tours tracés : {nb_tours} (200 max retenus)")
+        out.append(f"  Échanges Claude tracés : {nb_tours} (200 max retenus)")
         out.append(f"  Tokens cumulés : {sums[0]}↗ {sums[1]}↘")
         out.append(f"  Leçons (actives + archivées) : {nb_lecons_tot}")
     except Exception as e:
         out.append(f"  ❌ erreur stats : {e}")
+    
+    rapport = "\n".join(out)
+    if len(rapport) > 3800:
+        rapport = rapport[:3800] + "\n[…tronqué]"
+    return rapport
+
+
+def cmd_diagnostic():
+    """Vue diagnostic auto-détecté : anomalies des dernières 24h, patterns, suggestions de patch.
+    
+    Sortie en 4 sections :
+      🩺 État de santé global
+      📊 Anomalies groupées par type
+      🔁 Patterns récurrents (≥3 occurrences)
+      💡 Suggestions de patch (ciblées sur ce que tu peux corriger)
+    """
+    out = ["🩺 DIAGNOSTIC AUTO", "━━━━━━━━━━━━━━━━━━━━"]
+    
+    # 1. Santé globale
+    try:
+        from datetime import datetime, timedelta
+        seuil_24h = (datetime.now() - timedelta(hours=24)).isoformat()
+        seuil_1h = (datetime.now() - timedelta(hours=1)).isoformat()
+        
+        conn = sqlite3.connect(DB_PATH)
+        nb_24h = conn.execute(
+            "SELECT COUNT(*) FROM anomalies_auto WHERE ts >= ?", (seuil_24h,)
+        ).fetchone()[0]
+        nb_1h = conn.execute(
+            "SELECT COUNT(*) FROM anomalies_auto WHERE ts >= ?", (seuil_1h,)
+        ).fetchone()[0]
+        nb_critique_24h = conn.execute(
+            "SELECT COUNT(*) FROM anomalies_auto WHERE severite='critique' AND ts >= ?",
+            (seuil_24h,)
+        ).fetchone()[0]
+        nb_tours_24h = conn.execute(
+            "SELECT COUNT(*) FROM tour_trace WHERE ts >= ?", (seuil_24h,)
+        ).fetchone()[0]
+        conn.close()
+        
+        out.append(f"\n📊 SANTÉ (24h)")
+        out.append(f"  Échanges Claude (passés par appel_claude) : {nb_tours_24h}")
+        out.append(f"  Anomalies totales : {nb_24h}")
+        out.append(f"  Dont critiques : {nb_critique_24h}")
+        out.append(f"  Dernière heure : {nb_1h} anomalies")
+        if nb_tours_24h > 0:
+            taux = (nb_24h * 100) // nb_tours_24h
+            sante = "✅ saine" if taux < 5 else ("⚠️ tendue" if taux < 20 else "🔴 dégradée")
+            out.append(f"  Taux d'anomalie : {taux}% — {sante}")
+    except Exception as e:
+        out.append(f"  ❌ Erreur santé : {e}")
+    
+    # 2. Anomalies groupées
+    try:
+        groupes = anomalies_groupees(depuis_heures=24)
+        out.append(f"\n🔍 ANOMALIES PAR TYPE (24h)")
+        if not groupes:
+            out.append("  ✅ Aucune anomalie — système propre")
+        else:
+            for type_, nb, derniere_ts, severites in groupes[:8]:
+                # Sévérité max
+                sev_max = "info"
+                if "critique" in (severites or ""):
+                    sev_max = "🔴"
+                elif "warning" in (severites or ""):
+                    sev_max = "🟡"
+                else:
+                    sev_max = "🔵"
+                ts_court = (derniere_ts or "")[:19].replace("T", " ")
+                out.append(f"  {sev_max} {type_:20s} ×{nb:3d}  (dernière {ts_court})")
+    except Exception as e:
+        out.append(f"  ❌ Erreur groupage : {e}")
+    
+    # 3. Patterns récurrents (≥3 occurrences)
+    try:
+        recurrents = [g for g in groupes if g[1] >= 3]
+        if recurrents:
+            out.append(f"\n🔁 PATTERNS RÉCURRENTS (≥3 occurrences)")
+            for type_, nb, _, _ in recurrents[:5]:
+                out.append(f"  • {type_} : {nb} fois en 24h → mérite un patch")
+    except Exception:
+        pass
+    
+    # 4. Suggestions de patch (carte de patches connus → mappés sur types d'anomalies)
+    try:
+        suggestions = []
+        types_detectes = {g[0] for g in groupes if g[1] >= 2}
+        
+        catalogue_patches = {
+            "reponse_vide": "Ajouter une garantie de réponse minimum quand aucun tool n'est appelé",
+            "reponse_longue": "Renforcer les leçons sur la concision (utilise *probleme sur un cas long)",
+            "tokens_excessifs": "Routing modèle à revoir : Sonnet appelé sur des cas qui devraient être Haiku",
+            "search_overflow": "ha_search_entities doit retourner des résultats plus précis (filtre domaine)",
+            "boucle_tool": "Augmenter le compteur d'arrêt ou améliorer la résolution en 1er passage",
+            "tool_crash": "ha_call_service rencontre des entités qui n'existent plus — vérifier HA",
+            "api_timeout": "API Anthropic instable — retry avec backoff, ou bascule provisoire vers Haiku",
+            "api_authentic": "Renouveler la clé API Anthropic dans config.json",
+            "api_ratelimit": "Atteint le plafond Anthropic — augmenter quota ou ajouter throttling",
+            "api_bad_request": "Schéma de tools incorrect — vérifier HA_TOOLS",
+            "exception_inconnue": "Crash non typé — lire les logs pour identifier la trace",
+        }
+        
+        for type_ in types_detectes:
+            if type_ in catalogue_patches:
+                suggestions.append((type_, catalogue_patches[type_]))
+        
+        if suggestions:
+            out.append(f"\n💡 PATCHS SUGGÉRÉS")
+            for type_, patch in suggestions[:6]:
+                out.append(f"  → {type_}")
+                out.append(f"     {patch}")
+        else:
+            out.append(f"\n💡 Aucun patch suggéré pour le moment.")
+    except Exception as e:
+        out.append(f"  ❌ Erreur suggestions : {e}")
+    
+    # 5. Lien avec leçons : anomalies non couvertes par leçons
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        nb_lecons = conn.execute(
+            "SELECT COUNT(*) FROM lecons_apprises WHERE active=1"
+        ).fetchone()[0]
+        conn.close()
+        
+        types_recurrents = {g[0] for g in groupes if g[1] >= 3}
+        if types_recurrents and nb_lecons < 5:
+            out.append(f"\n📚 RECOMMANDATION")
+            out.append(f"  Tu as {nb_lecons} leçons actives mais {len(types_recurrents)} pattern(s) récurrent(s).")
+            out.append(f"  Tape *probleme après une mauvaise réponse pour enrichir l'apprentissage.")
+    except Exception:
+        pass
     
     rapport = "\n".join(out)
     if len(rapport) > 3800:
@@ -11930,6 +12061,49 @@ def _check_vocal_scripts(index, now):
         log.debug(f"Check vocal scripts: {e}")
 
 def traiter_message(texte):
+    """Wrapper global qui capture TOUTE exception Python silencieuse et la remonte
+    via anomalie_log → notification Telegram immédiate (sévérité critique).
+    
+    Le code réel est dans _traiter_message_impl. Ce wrapper garantit qu'aucun
+    bug Python ne reste silencieux — toute exception devient une erreur observable.
+    """
+    try:
+        return _traiter_message_impl(texte)
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        # Trouver la ligne la plus utile : le dernier "File" qui n'est pas dans Python stdlib
+        lignes_tb = [l.strip() for l in tb.split("\n") if l.strip()]
+        derniere_ligne = lignes_tb[-1] if lignes_tb else "(pas de trace)"
+        # Localisation : avant-dernière info "File ..."
+        localisation = ""
+        for l in reversed(lignes_tb):
+            if l.startswith('File "') and "/python3" not in l and "/dist-packages" not in l:
+                localisation = l[:200]
+                break
+        
+        details = f"{type(e).__name__}: {str(e)[:200]}"
+        if localisation:
+            details += f" | {localisation}"
+        
+        try:
+            log.error(f"❌ Exception dans traiter_message: {tb[:500]}")
+        except Exception:
+            pass
+        
+        # Remonter en anomalie critique → ping Telegram
+        try:
+            anomalie_log("exception_python", "critique",
+                         details=details,
+                         message_user=texte)
+        except Exception:
+            pass
+        
+        # Réponse utilisateur courte (le détail est dans la notif anomalie)
+        return "❌ Erreur interne. Une notification a été envoyée pour analyse."
+
+
+def _traiter_message_impl(texte):
     t = texte.strip().lower()
     # Enlever le "/" au début si présent
     if t.startswith("/"):
@@ -11963,6 +12137,7 @@ def traiter_message(texte):
         "debug": cmd_debug,
         "trace": cmd_trace,
         "cerveau": cmd_cerveau,
+        "diagnostic": cmd_diagnostic, "diag": cmd_diagnostic, "santé": cmd_diagnostic, "sante": cmd_diagnostic,
         "logs": cmd_logs,
         "mémoire": cmd_memoire, "memoire": cmd_memoire,
         "scan": cmd_scan,
