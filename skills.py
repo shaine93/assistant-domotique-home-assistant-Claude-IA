@@ -4056,16 +4056,38 @@ def _surveiller_imprimante(index, now):
 
 
 def _surveiller_batteries_critiques(etats, now):
-    """Batteries < 10% → alerte même la nuit"""
+    """Batteries < 10% → alerte même la nuit.
+    
+    Filtre strict :
+      - Uniquement domaine sensor.* (un état se mesure, un paramètre se règle)
+      - Exclure number.* / input_number.* (paramètres de configuration)
+      - Exclure les patterns de réglage : limite_, seuil_, priorite_, setpoint, min_, max_
+    
+    Bug fix 06/05/2026 : confusion entre `number.solarbank_e1600_limite_de_priorite_de_charge`
+    (paramètre, valeur 0% normale) et `sensor.solarbank_e1600_etat_de_charge` (état réel).
+    """
+    PATTERNS_PARAM_EXCLUS = ("limite_", "seuil_", "priorite_", "_setpoint",
+                              "_min_", "_max_", "_target", "_consigne")
+    
     for e in etats:
         eid = e["entity_id"]
+        eid_low = eid.lower()
         attrs = e.get("attributes", {})
+        
+        # ═══ FILTRES DE PARAMÉTRAGE (anti-faux positifs) ═══
+        # Domaine : seuls les sensor.* peuvent être un vrai état de charge
+        if not eid_low.startswith("sensor."):
+            continue
+        # Patterns de config dans le nom
+        if any(p in eid_low for p in PATTERNS_PARAM_EXCLUS):
+            continue
+        
         is_battery = (
             attrs.get("device_class") == "battery" or
-            "etat_de_charge" in eid.lower() or
-            "state_of_charge" in eid.lower() or
-            (("battery" in eid.lower() or "batterie" in eid.lower()) and
-             "puissance" not in eid.lower() and "power" not in eid.lower())
+            "etat_de_charge" in eid_low or
+            "state_of_charge" in eid_low or
+            (("battery" in eid_low or "batterie" in eid_low) and
+             "puissance" not in eid_low and "power" not in eid_low)
         )
         if not is_battery:
             continue
