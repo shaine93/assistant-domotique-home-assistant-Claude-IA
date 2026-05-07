@@ -9802,6 +9802,17 @@ def cmd_cycles():
     return rapport
 
 
+def cmd_portail():
+    """Déclenche une impulsion sur le portail (Ewelink inching 500ms).
+    Demande confirmation 2 étapes (sécurité)."""
+    mem_set("portail_confirmation_pending", "oui")
+    return (
+        "🚪 *Commande portail*\n\n"
+        "Tu vas envoyer une impulsion d'ouverture/fermeture au portail.\n\n"
+        "Réponds *oui* pour confirmer, ou autre chose pour annuler."
+    )
+
+
 def cmd_documentation():
     doc = f"""📖 ASSISTANT IA DOMOTIQUE v{VERSION}
 
@@ -12214,8 +12225,23 @@ def _traiter_message_impl(texte):
         "economies": cmd_economies,          # 💰 Détail des économies
         "dashboard": cmd_dashboard,          # 📊 Pousser les stats vers HA (Lovelace)
         "calendrier": cmd_calendrier,        # 📅 Événements calendrier HA
+        "portail": cmd_portail,                # 🚪 Portail (impulsion + confirmation)
         "test_meteo": cmd_test_meteo,      # 🧪 Test surveillance météo
     }
+
+    # ═══ CONFIRMATION PORTAIL ═══
+    if mem_get("portail_confirmation_pending") == "oui":
+        mem_set("portail_confirmation_pending", "")
+        if t in ("oui", "o", "yes", "y"):
+            try:
+                ha_post("services/switch/turn_on", {"entity_id": "switch.100291b89e_power"})
+                log.info("🚪 Portail : impulsion envoyée")
+                return "✅ Impulsion portail envoyée."
+            except Exception as e:
+                log.error(f"🚪 Portail erreur: {e}")
+                return f"❌ Erreur portail : {e}"
+        else:
+            return "❌ Commande portail annulée."
 
     if t in commandes:
         return commandes[t]()
