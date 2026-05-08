@@ -2694,14 +2694,11 @@ def _verifier_coherence_cartographie(index):
             # Première détection : alerte avec boutons
             mem_set(cle_alerte, datetime.now().isoformat())
             piece_str = f" [{fname}]" if fname else ""
-            telegram_send_buttons(
-                f"⚠️ Entité disparue de HA\n{entity_id}{piece_str}\nCatégorie : {categorie}",
-                [
-                    {"text": "✅ Supprimé (normal)", "callback_data": f"disparue_ok:{entity_id}"},
-                    {"text": "❌ Anormal", "callback_data": f"disparue_ko:{entity_id}"},
-                ]
-            )
-            log.warning(f"⚠️ Entité disparue : {entity_id}")
+            # PATCH 08/05/2026 : alertes Telegram coupées (spam 50+ messages le 07/05).
+            # On garde le log + le mem_set pour ne pas re-spam si on réactive plus tard.
+            # TODO : reconstruire avec batching (regrouper N entités disparues dans 1 seul message
+            #        + corrélation cause racine : Z2M down ? HA restart ? réseau ?)
+            log.warning(f"⚠️ Entité disparue (alerte muette) : {entity_id}{piece_str} [{categorie}]")
 
 
 def traiter_entites_en_attente(index):
@@ -2981,28 +2978,87 @@ def _maj_entites_connues():
 
 
 def comparer_entites_au_demarrage(etats):
-    """Compare les entités actuelles avec la mémoire"""
+    """Compare les entités actuelles avec la mémoire.
+
+    Patch 08/05/2026 v2 : anti-spam Telegram + fenêtre de grâce post-MAJ HA.
+    - Si HA vient de redémarrer (uptime < 5 min), on TEMPORISE toutes les alertes
+      d'entités disparues. Cause typique : MAJ HA qui les fait disparaître 1-2 min
+      avant qu'elles reviennent. Pas la peine d'alarmer Philippe pour rien.
+    - Si > 5 entités critiques disparues HORS fenêtre de grâce, on envoie UN seul
+      message groupé au lieu de N messages individuels.
+    - Si 1 à 5 disparues et HA stable, message individuel comme avant.
+    """
     connues = entites_connues_get_toutes()
     if not connues:
         log.info("Première comparaison — pas d'historique encore")
         return
 
+    # Fenêtre de grâce : si HA vient de redémarrer, on temporise
+    # On regarde l'âge de homeassistant.uptime ou last_changed du démarrage HA
+    ha_uptime_min = None
+    try:
+        # HA expose un sensor "homeassistant" ou bien on regarde le start_time
+        # via /api/config qui a un "version" et le bot peut comparer ses propres
+        # uptime via shared.py
+        from datetime import datetime, timezone
+        # Recherche d'un événement de démarrage récent dans les états
+        for e in etats:
+            if e.get("entity_id") == "sensor.uptime":
+                # Vérifier si ce sensor a une valeur date récente
+                state_str = e.get("state", "")
+                if state_str:
+                    try:
+                        boot = datetime.fromisoformat(state_str.replace("Z", "+00:00"))
+                        age = (datetime.now(timezone.utc) - boot).total_seconds() / 60
+                        ha_uptime_min = age
+                        break
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    if ha_uptime_min is not None and ha_uptime_min < 5:
+        log.warning(
+            f"⏸️ HA vient de redémarrer (uptime={ha_uptime_min:.1f} min). "
+            f"Alertes d'entités disparues temporisées pour éviter spam post-MAJ."
+        )
+        return  # On sort sans envoyer aucune alerte — HA n'est pas stable
+
     actuelles = set(e["entity_id"] for e in etats)
     connues_set = set(connues.keys())
 
-    # Entités disparues
+    # Entités disparues (filtrer celles qui sont critiques alerte_h <= 4)
     disparues = connues_set - actuelles
+    disparues_critiques = []
     for eid in disparues:
         cat = connues.get(eid, "")
         criticite = CRITICITE_ENTITES.get(cat, {})
         alerte_h = criticite.get("alerte_h", 48)
-        label = criticite.get("label", cat)
         if alerte_h <= 4:
+            label = criticite.get("label", cat)
+            disparues_critiques.append((eid, label))
+            log.warning(f"Entité disparue critique: {eid}")
+
+    # Anti-spam : si > 5 entités critiques disparues, message GROUPÉ
+    if len(disparues_critiques) > 5:
+        labels_count = {}
+        for eid, label in disparues_critiques:
+            labels_count[label] = labels_count.get(label, 0) + 1
+        recap = "\n".join(f"  • {lbl} : {n}" for lbl, n in sorted(labels_count.items()))
+        telegram_send(
+            f"🚨 INCIDENT GÉNÉRALISÉ — {len(disparues_critiques)} entités critiques disparues\n\n"
+            f"{recap}\n\n"
+            f"Cause probable : redémarrage HA, panne réseau, ou intégration HS.\n"
+            f"Pas de message individuel pour éviter le spam."
+        )
+        log.warning(f"INCIDENT GÉNÉRALISÉ : {len(disparues_critiques)} disparues — 1 message groupé envoyé")
+    elif disparues_critiques:
+        # 1 à 5 disparues : message individuel comme avant
+        for eid, label in disparues_critiques:
             telegram_send(
                 f"🚨 ENTITÉ DISPARUE — {label}\n{eid}\n"
                 f"Non trouvée dans Home Assistant au démarrage."
             )
-            log.warning(f"Entité disparue critique: {eid}")
 
     carto_connues = set(cartographie_get_toutes().keys())
     nouvelles = actuelles - carto_connues
