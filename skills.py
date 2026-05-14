@@ -11442,6 +11442,12 @@ def _heartbeat_guard_actif(guard_name, index, now):
 
 
 def _heartbeat_observe(index, now):
+    # PATCH 14/05/2026 : skill heartbeat désactivé totalement.
+    # Cause : harcèlement Telegram (Ecojoko gap météo, Solarbank cloud).
+    # La table sensor_heartbeat n'a pas été purgée le 04/05, ce qui a réactivé
+    # la surveillance des 8 sensors piliers historiques.
+    # Action : skill désactivé jusqu'à reconstruction avec corrélation météo robuste.
+    return
     """Skill heartbeat_pilier : surveille la fraîcheur de mise à jour des sensors énergétiques.
     
     3 phases automatiques :
