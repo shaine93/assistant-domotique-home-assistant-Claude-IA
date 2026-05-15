@@ -11383,7 +11383,8 @@ def _heartbeat_guard_actif(guard_name, index, now):
             if rain_e:
                 state = rain_e.get("state", "")
                 try:
-                    if float(state) > 60:
+                    # Patch 15/05/2026 : seuil 60 → 40 (plus prudent, on étouffe plus facilement)
+                    if float(state) > 40:
                         return True
                 except (ValueError, TypeError):
                     pass
@@ -11399,14 +11400,19 @@ def _heartbeat_guard_actif(guard_name, index, now):
                 w_e = index.get(weather_eid)
                 if w_e:
                     wstate = w_e.get("state", "").lower()
-                    if wstate in ("rainy", "pouring", "snowy", "snowy-rainy", "fog", "cloudy", "hail"):
+                    # Patch 15/05/2026 : ajout lightning-rainy, partlycloudy, lightning, windy
+                    # weather.pavillons_sous_bois renvoyait "lightning-rainy" → 839W produits
+                    # mais sensor figé : la production basse couvre les gaps.
+                    if wstate in ("rainy", "pouring", "snowy", "snowy-rainy", "fog", "cloudy",
+                                  "hail", "lightning-rainy", "lightning", "partlycloudy",
+                                  "windy", "windy-variant", "exceptional"):
                         return True
-                    # Si attribut cloud_coverage disponible → > 80%
+                    # Si attribut cloud_coverage disponible → seuil 80 → 60 (plus prudent)
                     attrs = w_e.get("attributes", {})
                     cloud = attrs.get("cloud_coverage")
                     if cloud is not None:
                         try:
-                            if float(cloud) > 80:
+                            if float(cloud) > 60:
                                 return True
                         except (ValueError, TypeError):
                             pass
@@ -11441,234 +11447,256 @@ def _heartbeat_guard_actif(guard_name, index, now):
     return False
 
 
-def _heartbeat_observe(index, now):
-    # PATCH 14/05/2026 : skill heartbeat désactivé totalement.
-    # Cause : harcèlement Telegram (Ecojoko gap météo, Solarbank cloud).
-    # La table sensor_heartbeat n'a pas été purgée le 04/05, ce qui a réactivé
-    # la surveillance des 8 sensors piliers historiques.
-    # Action : skill désactivé jusqu'à reconstruction avec corrélation météo robuste.
-    return
-    """Skill heartbeat_pilier : surveille la fraîcheur de mise à jour des sensors énergétiques.
-    
-    3 phases automatiques :
-      1. Apprentissage (J0 à J7) : observation silencieuse, pas d'alertes
-      2. Calibration (J7) : calcul des seuils depuis l'historique HA des 7 derniers jours
-      3. Surveillance (J7+) : alertes si gap > P99 × 2 (warning) ou × 5 (critique)
-    
-    Recompute hebdomadaire pour s'adapter aux saisons.
-    
-    Périmètre : 8 sensors énergétiques piliers (Ecojoko + APSystems + Anker)
-    
-    Fréquence : check toutes les 5 minutes (garde via memoire 'heartbeat_check')
-    Cooldown alertes : 6h (warning), 1h (critique)
-    
-    CRASH-PROOF.
-    
-    Ajouté 25/04/2026 — skill apprenant validé avec Philippe.
-    """
-    from datetime import datetime, timedelta, timezone
+# ═══════════════════════════════════════════════════════════════════════════════
+# SKILL HEARTBEAT V2 — Reconstruction propre (14/05/2026)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Architecture :
+#   - 3 sensors surveillés UNIQUEMENT (whitelist explicite ci-dessous)
+#   - Phase log_only obligatoire pendant 7 jours après activation
+#   - Bascule auto en mode "alerts" après 7j (ou via /heartbeat mode alerts)
+#   - Guards contextuels OBLIGATOIRES (réutilise _heartbeat_guard_actif existant)
+#   - Cooldown 24h par sensor en mode alerts (anti-spam même si gap persiste)
+#   - Table dédiée heartbeat_v2 (séparée de l'ancienne sensor_heartbeat)
+#
+# Échecs corrigés :
+#   - 04/05 : liste Python vidée mais table SQL conservait les baselines orphelines
+#   - 14/05 : skill réactivé sans phase log_only → spam Ecojoko/Solarbank
+#   - Solarbank etat_du_cloud retiré (gaps de plusieurs jours = normal)
+#   - Sensors volatils retirés (temps_reel, surplus, etat_de_charge)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Whitelist explicite : 3 sensors essentiels au ROI
+_HEARTBEAT_V2_SENSORS = [
+    {
+        "entity_id": "sensor.ecojoko_consommation_reseau",
+        "guard": "none",  # Sensor cumulatif strictement croissant, pas de raison qu'il s'arrête
+        "max_gap_min": 30,  # Doit s'updater au moins toutes les 30 minutes
+        "description": "Consommation réseau cumulative Ecojoko (kWh)",
+    },
+    {
+        "entity_id": "sensor.ecu_today_energy",
+        "guard": "solar",  # Étouffé si nuit/pluie/nuages
+        "max_gap_min": 60,  # 1h max entre 2 updates
+        "description": "Production solaire APSystems jour (kWh)",
+    },
+    {
+        "entity_id": "sensor.ecu_current_power",
+        "guard": "solar",  # Étouffé si nuit/pluie/nuages
+        "max_gap_min": 30,  # 30min max entre 2 updates
+        "description": "Production solaire APSystems instant (W)",
+    },
+]
+
+
+def _init_heartbeat_v2_table():
+    """Initialise la table SQL dédiée pour le heartbeat v2."""
     try:
-        # ═══ Anti-flood post-restart ═══
-        # Si l'agent vient de démarrer (< 10min), pas d'alerte heartbeat. On laisse le temps
-        # à l'index HA de se rafraîchir et aux baselines de se recaler. Évite les rafales
-        # d'alertes après chaque deploy/restart sur des baselines obsolètes.
-        try:
-            uptime_sec = (datetime.now() - _SERVICE_STARTED_AT).total_seconds() if "_SERVICE_STARTED_AT" in globals() else 9999
-        except Exception:
-            uptime_sec = 9999
-        if uptime_sec < 600:
-            log.debug(f"💓 heartbeat: anti-flood post-restart (uptime {int(uptime_sec)}s < 600s)")
-            mem_set("heartbeat_check", now.isoformat())
-            return
-        
-        # Garde de fréquence : check toutes les 5 min
-        derniere = mem_get("heartbeat_check")
-        if derniere:
-            try:
-                if (now - datetime.fromisoformat(derniere)).total_seconds() < 300:
-                    return
-            except Exception:
-                pass
-        
-        # S'assurer que la table existe
-        _heartbeat_init_table()
-        
-        # ═══ Reset one-shot v2 (05/05/2026) ═══
-        # Les baselines apprises avant la refonte de la liste sont obsolètes.
-        # On force un reset une seule fois, marqué par mem_set("heartbeat_v2_reset_done").
-        if not mem_get("heartbeat_v2_reset_done"):
-            try:
-                conn_reset = sqlite3.connect(DB_PATH)
-                conn_reset.execute("DELETE FROM sensor_heartbeat")
-                conn_reset.commit()
-                conn_reset.close()
-                mem_set("heartbeat_v2_reset_done", "1")
-                log.info("💓 heartbeat: reset one-shot v2 effectué — apprentissage 7j relancé")
-            except Exception as e:
-                log.debug(f"heartbeat reset v2: {e}")
-        
         conn = sqlite3.connect(DB_PATH)
-        
-        for sensor_entry in _HEARTBEAT_SENSORS_PILIERS:
-            # Unpack tuple (entity_id, guard_name) — rétrocompatible si str pure
-            if isinstance(sensor_entry, tuple) and len(sensor_entry) == 2:
-                entity_id, guard_name = sensor_entry
-            else:
-                entity_id, guard_name = sensor_entry, "none"
-            
-            # Lire l'état actuel du sensor depuis l'index
-            e = index.get(entity_id)
-            
-            # Lire la baseline existante
-            row = conn.execute(
-                "SELECT median_sec, p95_sec, p99_sec, samples_count, last_recompute, "
-                "learning_started, learning_complete FROM sensor_heartbeat WHERE entity_id=?",
-                (entity_id,)
-            ).fetchone()
-            
-            if not row:
-                # 1ère fois qu'on voit ce sensor : démarrer l'apprentissage
-                conn.execute(
-                    "INSERT INTO sensor_heartbeat (entity_id, learning_started, learning_complete) "
-                    "VALUES (?, ?, 0)",
-                    (entity_id, now.isoformat())
-                )
-                conn.commit()
-                continue
-            
-            median_sec, p95_sec, p99_sec, samples, last_recompute, learning_started, learning_complete = row
-            
-            # Phase 1 : apprentissage en cours ?
-            if not learning_complete:
-                try:
-                    started = datetime.fromisoformat(learning_started)
-                    days_learning = (now - started).total_seconds() / 86400
-                except Exception:
-                    days_learning = 0
-                
-                if days_learning < 7:
-                    # Encore en apprentissage, on continue en silence
-                    continue
-                
-                # Phase 2 : 7 jours écoulés, calibrer les seuils
-                result = _heartbeat_apprendre(entity_id)
-                if not result:
-                    continue
-                median_sec, p95_sec, p99_sec, samples = result
-                conn.execute(
-                    "UPDATE sensor_heartbeat SET median_sec=?, p95_sec=?, p99_sec=?, "
-                    "samples_count=?, last_recompute=?, learning_complete=1 WHERE entity_id=?",
-                    (median_sec, p95_sec, p99_sec, samples, now.isoformat(), entity_id)
-                )
-                conn.commit()
-                log.info(f"💓 heartbeat: {entity_id} appris (médiane {median_sec}s, P99 {p99_sec}s, {samples} samples)")
-                continue
-            
-            # Phase 3 : surveillance active
-            # Recompute hebdomadaire ?
-            try:
-                last_rc = datetime.fromisoformat(last_recompute)
-                if (now - last_rc).total_seconds() > 7 * 86400:
-                    result = _heartbeat_apprendre(entity_id)
-                    if result:
-                        median_sec, p95_sec, p99_sec, samples = result
-                        conn.execute(
-                            "UPDATE sensor_heartbeat SET median_sec=?, p95_sec=?, p99_sec=?, "
-                            "samples_count=?, last_recompute=? WHERE entity_id=?",
-                            (median_sec, p95_sec, p99_sec, samples, now.isoformat(), entity_id)
-                        )
-                        conn.commit()
-                        log.info(f"💓 heartbeat: {entity_id} recalibré (médiane {median_sec}s, P99 {p99_sec}s)")
-            except Exception:
-                pass
-            
-            # Calculer le gap actuel
-            if not e:
-                # Sensor disparu de HA → alerte critique
-                _alerter_si_nouveau(
-                    f"heartbeat_absent_{entity_id}",
-                    f"🚨 HEARTBEAT — Sensor absent de HA\n━━━━━━━━━━━━━━━━━━\n"
-                    f"  • {entity_id}\n"
-                    f"L'entité n'est plus présente dans Home Assistant.\n"
-                    f"Vérifier l'intégration concernée.",
-                    delai_h=1
-                )
-                continue
-            
-            last_updated = e.get("last_updated", "")
-            if not last_updated:
-                continue
-            try:
-                dt_upd = datetime.fromisoformat(last_updated.replace("Z", "+00:00"))
-                if dt_upd.tzinfo is None:
-                    dt_upd = dt_upd.replace(tzinfo=timezone.utc)
-                now_utc = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now
-                gap_sec = (now_utc - dt_upd).total_seconds()
-            except Exception:
-                continue
-            
-            # Seuils dynamiques basés sur la baseline apprise
-            seuil_warning = p99_sec * 2 if p99_sec else 600
-            seuil_critique = p99_sec * 5 if p99_sec else 1800
-            
-            # ═══ Guard contextuel (météo/horaire) ═══
-            # Étouffe les alertes pour les sensors solaires en jours nuageux/pluvieux/nuit,
-            # et pour la batterie Anker quand elle est saturée. Voir _heartbeat_guard_actif.
-            if (gap_sec > seuil_warning) and _heartbeat_guard_actif(guard_name, index, now):
-                log.debug(f"💓 heartbeat: {entity_id} gap {int(gap_sec/60)}min étouffé (guard={guard_name})")
-                continue
-            
-            if gap_sec > seuil_critique:
-                _alerter_si_nouveau(
-                    f"heartbeat_critique_{entity_id}",
-                    f"🚨 HEARTBEAT CRITIQUE\n━━━━━━━━━━━━━━━━━━\n"
-                    f"  • {entity_id}\n"
-                    f"  • Gap : {int(gap_sec/60)}min (normal: médiane {int(median_sec/60) if median_sec else 0}min, P99 {int(p99_sec/60) if p99_sec else 0}min)\n"
-                    f"  • State: {e.get('state', '?')}\n\n"
-                    f"Probable panne : intégration HA HS, équipement débranché, ou cloud du fabricant down.",
-                    delai_h=1
-                )
-            elif gap_sec > seuil_warning:
-                _alerter_si_nouveau(
-                    f"heartbeat_warning_{entity_id}",
-                    f"⚠️ HEARTBEAT — Sensor figé\n━━━━━━━━━━━━━━━━━━\n"
-                    f"  • {entity_id}\n"
-                    f"  • Gap : {int(gap_sec/60)}min (normal: médiane {int(median_sec/60) if median_sec else 0}min, P99 {int(p99_sec/60) if p99_sec else 0}min)\n"
-                    f"  • State: {e.get('state', '?')}\n\n"
-                    f"Surveillance à confirmer : peut être normal selon le contexte.",
-                    delai_h=6
-                )
-        
-        # Sensors HC/HP — traités à part (1 update/jour à minuit)
-        for entity_id in _HEARTBEAT_SENSORS_TARIF:
-            e = index.get(entity_id)
-            if not e:
-                continue
-            last_updated = e.get("last_updated", "")
-            if not last_updated:
-                continue
-            try:
-                dt_upd = datetime.fromisoformat(last_updated.replace("Z", "+00:00"))
-                if dt_upd.tzinfo is None:
-                    dt_upd = dt_upd.replace(tzinfo=timezone.utc)
-                now_utc = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now
-                gap_h = (now_utc - dt_upd).total_seconds() / 3600
-                # 26h = 1 jour + 2h de marge après le rollover de minuit
-                if gap_h > 26:
-                    _alerter_si_nouveau(
-                        f"heartbeat_tarif_{entity_id}",
-                        f"⚠️ HEARTBEAT TARIF — Rollover quotidien raté\n━━━━━━━━━━━━━━━━━━\n"
-                        f"  • {entity_id}\n"
-                        f"  • Pas mis à jour depuis {gap_h:.1f}h (attendu: 1 update/jour à minuit)\n\n"
-                        f"Les calculs HP/HC peuvent être basés sur des valeurs périmées.\n"
-                        f"Action : redémarrer l'intégration Ecojoko dans HA.",
-                        delai_h=12
-                    )
-            except Exception:
-                pass
-        
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS heartbeat_v2 (
+                entity_id TEXT PRIMARY KEY,
+                last_alert_iso TEXT,
+                last_gap_min INTEGER,
+                total_alerts INTEGER DEFAULT 0,
+                total_dryrun INTEGER DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS heartbeat_v2_dryrun (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_iso TEXT,
+                entity_id TEXT,
+                gap_min INTEGER,
+                guard_active INTEGER,
+                would_alert INTEGER
+            )
+        """)
+        conn.commit()
         conn.close()
+    except Exception as e:
+        log.debug(f"_init_heartbeat_v2_table: {e}")
+
+
+def _heartbeat_v2_mode():
+    """Retourne le mode courant du skill heartbeat v2 :
+       - "log_only" : pas d'alerte Telegram, logs SQL seulement (par défaut)
+       - "alerts"   : alertes Telegram envoyées si gap dépassé et guard inactif
+       - "off"      : désactivation totale (équivalent à pas appelé)
+    """
+    return mem_get("heartbeat_v2_mode") or "log_only"
+
+
+def _heartbeat_v2_activation_date():
+    """Retourne la date ISO d'activation du mode log_only (ou met now() si jamais activé)."""
+    d = mem_get("heartbeat_v2_activated_at")
+    if not d:
+        d = datetime.now(timezone.utc).isoformat()
+        mem_set("heartbeat_v2_activated_at", d)
+    return d
+
+
+def _heartbeat_v2_check_auto_bascule(now):
+    """Bascule automatique log_only → alerts après 7 jours."""
+    if _heartbeat_v2_mode() != "log_only":
+        return
+    activated = _heartbeat_v2_activation_date()
+    try:
+        act_dt = datetime.fromisoformat(activated)
+        if act_dt.tzinfo is None:
+            act_dt = act_dt.replace(tzinfo=timezone.utc)
+        now_utc = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now
+        days = (now_utc - act_dt).total_seconds() / 86400
+        if days >= 7:
+            mem_set("heartbeat_v2_mode", "alerts")
+            log.warning(f"💓 heartbeat_v2 : bascule auto log_only → alerts après {days:.1f} jours")
+            telegram_send(
+                "✅ HEARTBEAT V2 — Bascule en mode ALERTES\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"Le skill a tourné {days:.0f} jours en mode log_only sans incident.\n"
+                "Il bascule automatiquement en mode alertes Telegram.\n\n"
+                "Sensors surveillés :\n"
+                "  • sensor.ecojoko_consommation_reseau (gap max 30min)\n"
+                "  • sensor.ecu_today_energy (gap max 60min, guard solar)\n"
+                "  • sensor.ecu_current_power (gap max 30min, guard solar)\n\n"
+                "Pour désactiver à tout moment : /heartbeat off"
+            )
+    except Exception as e:
+        log.debug(f"_heartbeat_v2_check_auto_bascule: {e}")
+
+
+def _heartbeat_observe(index, now):
+    """Skill heartbeat_pilier v2 (reconstruction propre 14/05/2026).
+
+    Surveille 3 sensors énergétiques critiques avec garde-fous stricts :
+      - Whitelist explicite (pas d'auto-détection)
+      - Guards contextuels obligatoires (météo, horaire solaire)
+      - Mode log_only par défaut pendant 7 jours puis bascule auto
+      - Cooldown 24h par sensor anti-spam
+      - Désactivable via /heartbeat off
+
+    Voir _HEARTBEAT_V2_SENSORS pour la liste exacte des sensors surveillés.
+    """
+    try:
+        # Init table si nécessaire
+        _init_heartbeat_v2_table()
+
+        # Vérifier le mode
+        mode = _heartbeat_v2_mode()
+        if mode == "off":
+            return
+
+        # Auto-bascule log_only → alerts après 7j
+        _heartbeat_v2_check_auto_bascule(now)
+        mode = _heartbeat_v2_mode()  # relire après bascule potentielle
+
+        # Pour chaque sensor surveillé
+        for cfg in _HEARTBEAT_V2_SENSORS:
+            entity_id = cfg["entity_id"]
+            guard_name = cfg["guard"]
+            max_gap_min = cfg["max_gap_min"]
+
+            e = index.get(entity_id)
+            if not e:
+                continue  # sensor pas dans l'état actuel, on skip
+
+            # Calculer le gap depuis le dernier update
+            last_updated = e.get("last_updated", "")
+            if not last_updated:
+                continue
+            try:
+                dt_upd = datetime.fromisoformat(last_updated.replace("Z", "+00:00"))
+                if dt_upd.tzinfo is None:
+                    dt_upd = dt_upd.replace(tzinfo=timezone.utc)
+                now_utc = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now
+                gap_min = int((now_utc - dt_upd).total_seconds() / 60)
+            except Exception:
+                continue
+
+            # Si gap acceptable, rien à faire
+            if gap_min <= max_gap_min:
+                continue
+
+            # Gap dépassé. Vérifier le guard
+            guard_active = _heartbeat_guard_actif(guard_name, index, now)
+
+            # En mode log_only : on enregistre dans heartbeat_v2_dryrun
+            if mode == "log_only":
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    conn.execute(
+                        "INSERT INTO heartbeat_v2_dryrun (ts_iso, entity_id, gap_min, guard_active, would_alert) VALUES (?, ?, ?, ?, ?)",
+                        (now.isoformat(), entity_id, gap_min, int(guard_active), int(not guard_active))
+                    )
+                    conn.execute(
+                        "INSERT OR IGNORE INTO heartbeat_v2 (entity_id, total_dryrun) VALUES (?, 0)",
+                        (entity_id,)
+                    )
+                    conn.execute(
+                        "UPDATE heartbeat_v2 SET total_dryrun = total_dryrun + 1, last_gap_min = ? WHERE entity_id = ?",
+                        (gap_min, entity_id)
+                    )
+                    conn.commit()
+                    conn.close()
+                except Exception as ex:
+                    log.debug(f"heartbeat_v2 log_only: {ex}")
+                continue
+
+            # Mode alerts : envoyer Telegram si guard inactif et cooldown OK
+            if guard_active:
+                log.debug(f"💓 heartbeat_v2 : {entity_id} gap {gap_min}min étouffé (guard={guard_name})")
+                continue
+
+            # Vérifier cooldown 24h
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                row = conn.execute(
+                    "SELECT last_alert_iso FROM heartbeat_v2 WHERE entity_id = ?",
+                    (entity_id,)
+                ).fetchone()
+                last_alert_iso = row[0] if row else None
+                if last_alert_iso:
+                    try:
+                        last_dt = datetime.fromisoformat(last_alert_iso)
+                        if last_dt.tzinfo is None:
+                            last_dt = last_dt.replace(tzinfo=timezone.utc)
+                        hours_since = (now_utc - last_dt).total_seconds() / 3600
+                        if hours_since < 24:
+                            conn.close()
+                            log.debug(f"💓 heartbeat_v2 : {entity_id} cooldown 24h actif ({hours_since:.1f}h)")
+                            continue
+                    except Exception:
+                        pass
+
+                # Envoyer l'alerte
+                telegram_send(
+                    "🚨 HEARTBEAT V2 — Sensor figé\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    f"  • {entity_id}\n"
+                    f"  • {cfg['description']}\n"
+                    f"  • Gap : {gap_min} min (seuil : {max_gap_min} min)\n"
+                    f"  • State actuel : {e.get('state', '?')}\n\n"
+                    "Cause probable : intégration HA, équipement, ou cloud du fabricant.\n"
+                    "Cooldown : pas de nouvelle alerte pour ce sensor avant 24h.\n"
+                    "Pour désactiver : /heartbeat off"
+                )
+
+                # Mettre à jour la table
+                conn.execute(
+                    "INSERT OR IGNORE INTO heartbeat_v2 (entity_id, total_alerts) VALUES (?, 0)",
+                    (entity_id,)
+                )
+                conn.execute(
+                    "UPDATE heartbeat_v2 SET last_alert_iso = ?, last_gap_min = ?, total_alerts = total_alerts + 1 WHERE entity_id = ?",
+                    (now.isoformat(), gap_min, entity_id)
+                )
+                conn.commit()
+                conn.close()
+            except Exception as ex:
+                log.warning(f"heartbeat_v2 alert: {ex}")
+
+        # Marquer le check
         mem_set("heartbeat_check", now.isoformat())
+
     except Exception as e:
         log.debug(f"heartbeat_observe: {e}")
 
