@@ -7151,12 +7151,15 @@ def _comparer(etats, index, now, snapshot):
     baseline_detecter_anomalies(etats)
 
     # Anomalie : nombre d'entités unavailable anormalement élevé
+    # Patch 20/05/2026 : seuil 30 → 50. Avec 1364 entités dont nombreux Zigbee sur piles,
+    # 30% (~400 entités) est en fait un baseline normal (capteurs endormis).
+    # Le vrai signal d'alerte commence à 50%+ (panne réelle d'intégration).
     pct_ko = snapshot["nb_unavailable"] / max(snapshot["nb_entites"], 1) * 100
-    if pct_ko > 30:
+    if pct_ko > 50:
         anomalies.append({
             "type": "entites_ko",
             "message": f"{snapshot['nb_unavailable']}/{snapshot['nb_entites']} entités hors ligne ({pct_ko:.0f}%)",
-            "severite": "haute" if pct_ko > 50 else "moyenne",
+            "severite": "haute" if pct_ko > 70 else "moyenne",
         })
 
     # Anomalie : production solaire nulle en plein jour
@@ -11813,8 +11816,26 @@ def _alerte_zigbee_device_mort(index, now):
         ).fetchall()
         conn.close()
 
+        # Patch 20/05/2026 : whitelist d'exclusion pour devices éteints normalement
+        # iPad de philippe : éteint la nuit, pas anormal
+        # OctoPrint : éteint quand pas d'impression (la majorité du temps)
+        # MacBook : suspendu, normal aussi
+        EXCLUSIONS_DEVICES_MORTS = [
+            "ipad_de_philippe",
+            "ipad_de_michele",
+            "octoprint",
+            "mbp",
+            "macbook",
+            "imprimante_canon",  # imprimante mise en veille auto
+        ]
+
         morts = []
         for eid, fname in rows:
+            # Skip si entité whitelisted (éteinte normalement)
+            eid_lower = eid.lower()
+            fname_lower = (fname or "").lower()
+            if any(excl in eid_lower or excl in fname_lower for excl in EXCLUSIONS_DEVICES_MORTS):
+                continue
             e = index.get(eid)
             if e and e.get("state") == "unavailable":
                 # Vérifier depuis combien de temps

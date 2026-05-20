@@ -538,6 +538,11 @@ def surveillance_batteries():
                 for e in etats:
                     eid = e["entity_id"]
                     attrs_b = e.get("attributes", {})
+                    # Patch 20/05/2026 : exclure number.* (paramètres, pas niveaux de batterie)
+                    # Cas : number.solarbank_e1600_limite_de_priorite_de_charge à 0%
+                    # spammait "🚨 BATTERIES FAIBLES" alors que c'est un PARAMÈTRE.
+                    if eid.startswith("number.") or eid.startswith("input_number."):
+                        continue
                     is_battery = (
                         attrs_b.get("device_class") == "battery" or
                         "etat_de_charge" in eid.lower() or
