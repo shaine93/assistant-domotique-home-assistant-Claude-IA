@@ -11472,20 +11472,20 @@ def _heartbeat_guard_actif(guard_name, index, now):
 _HEARTBEAT_V2_SENSORS = [
     {
         "entity_id": "sensor.ecojoko_consommation_reseau",
-        "guard": "none",  # Sensor cumulatif strictement croissant, pas de raison qu'il s'arrête
-        "max_gap_min": 30,  # Doit s'updater au moins toutes les 30 minutes
+        "guard": "none",
+        "max_gap_min": 120,  # Patch 01/06/2026 : 30→120 (cloud Ecojoko peut pauser)
         "description": "Consommation réseau cumulative Ecojoko (kWh)",
     },
     {
         "entity_id": "sensor.ecu_today_energy",
-        "guard": "solar",  # Étouffé si nuit/pluie/nuages
-        "max_gap_min": 60,  # 1h max entre 2 updates
+        "guard": "solar",
+        "max_gap_min": 180,  # Patch 01/06/2026 : 60→180 (intégration little_monkey lente)
         "description": "Production solaire APSystems jour (kWh)",
     },
     {
         "entity_id": "sensor.ecu_current_power",
-        "guard": "solar",  # Étouffé si nuit/pluie/nuages
-        "max_gap_min": 30,  # 30min max entre 2 updates
+        "guard": "solar",
+        "max_gap_min": 180,  # Patch 01/06/2026 : 30→180
         "description": "Production solaire APSystems instant (W)",
     },
 ]

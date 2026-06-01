@@ -9,6 +9,50 @@ import re
 import random
 import requests
 import sqlite3
+
+# Patch 30/05/2026 : Sessions HTTP persistantes globales (keepalive).
+# Sur OVH le handshake TLS prend ~1s par requête → bot ultra lent.
+# Une session par host réutilise la connexion = latence /5-/10.
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
+
+_HTTP_SESSIONS = {}
+
+def _get_session(url):
+    """Renvoie une session persistante par host (cache global)."""
+    try:
+        host = url.split("/")[2] if "://" in url else "default"
+    except Exception:
+        host = "default"
+    if host not in _HTTP_SESSIONS:
+        s = requests.Session()
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=10,
+                              max_retries=Retry(total=2, backoff_factor=0.2))
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        s.headers.update({"Connection": "keep-alive"})
+        _HTTP_SESSIONS[host] = s
+    return _HTTP_SESSIONS[host]
+
+# Monkey-patch global : tous les requests.get/post utilisent les sessions cachées.
+_orig_get = requests.get
+_orig_post = requests.post
+
+def _patched_get(url, **kw):
+    try:
+        return _get_session(url).get(url, **kw)
+    except Exception:
+        return _orig_get(url, **kw)
+
+def _patched_post(url, **kw):
+    try:
+        return _get_session(url).post(url, **kw)
+    except Exception:
+        return _orig_post(url, **kw)
+
+requests.get = _patched_get
+requests.post = _patched_post
+
 import smtplib
 import time
 import threading
