@@ -11473,7 +11473,7 @@ _HEARTBEAT_V2_SENSORS = [
     {
         "entity_id": "sensor.ecojoko_consommation_reseau",
         "guard": "none",
-        "max_gap_min": 120,  # Patch 01/06/2026 : 30→120 (cloud Ecojoko peut pauser)
+        "max_gap_min": 240,  # Patch 01/06/2026 : 30→240 (cloud Ecojoko push toutes les 2h+, normal)
         "description": "Consommation réseau cumulative Ecojoko (kWh)",
     },
     {
