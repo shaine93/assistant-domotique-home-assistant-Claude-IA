@@ -11470,12 +11470,9 @@ def _heartbeat_guard_actif(guard_name, index, now):
 
 # Whitelist explicite : 3 sensors essentiels au ROI
 _HEARTBEAT_V2_SENSORS = [
-    {
-        "entity_id": "sensor.ecojoko_consommation_reseau",
-        "guard": "none",
-        "max_gap_min": 240,  # Patch 01/06/2026 : 30→240 (cloud Ecojoko push toutes les 2h+, normal)
-        "description": "Consommation réseau cumulative Ecojoko (kWh)",
-    },
+    # Patch 03/06/2026 : ecojoko_consommation_reseau retiré du heartbeat.
+    # Le cloud Ecojoko push de manière irrégulière (gaps 120-280 min normaux).
+    # Sensor cumulatif Wh, pas critique pour le ROI temps réel.
     {
         "entity_id": "sensor.ecu_today_energy",
         "guard": "solar",
