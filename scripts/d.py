@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
-import subprocess
-with open("/proc/loadavg") as f: print(f"loadavg: {f.read().strip()}")
-with open("/proc/meminfo") as f:
-    for line in f:
-        if line.startswith(("MemTotal:", "MemFree:", "MemAvailable:")):
-            print(f"  {line.strip()}")
-print("\n=== processus ===")
-r = subprocess.run(["ps","auxf"], capture_output=True, text=True)
-for line in r.stdout.split("\n"):
-    if "assistant.py" in line or "deploy_server" in line or "cloudflared" in line:
-        print(line[:220])
-print("\n=== 25 dernieres lignes log ===")
-try:
-    with open("/home/lolufe/assistant/assistant.log") as f: lines = f.readlines()
-    for l in lines[-25:]:
-        if any(k in l.lower() for k in ["error","warning","timeout","retry","claude","anthropic","telegram","sendMessage"]):
-            print(l.rstrip()[:280])
-except Exception as e: print(f"err: {e}")
+import json, requests
+with open("/home/lolufe/assistant/config.json") as f:
+    cfg = json.load(f)
+H = {"Authorization": "Bearer " + cfg["ha_token"], "Content-Type": "application/json"}
+BASE = cfg["ha_url"]
+
+# TEST 4 : sans channel custom, juste image + actions
+payload = {
+    "title": "TEST 4 - Sans channel",
+    "message": "Notif simple avec image",
+    "data": {
+        "image": "/api/camera_proxy/camera.doorbell_repeater_74a8",
+        "clickAction": "/lovelace/portail",
+        "actions": [
+            {"action": "URI", "title": "Voir le live", "uri": "/lovelace/portail"}
+        ]
+    }
+}
+r = requests.post(BASE + "/api/services/notify/mobile_app_22081212ug",
+                  headers=H, json=payload, timeout=15, verify=False)
+print("TEST 4:", r.status_code, r.text[:200])
