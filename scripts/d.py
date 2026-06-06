@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
-import json, requests
-with open("/home/lolufe/assistant/config.json") as f:
+import json, requests, websocket
+with open('/home/lolufe/assistant/config.json') as f:
     cfg = json.load(f)
-H = {"Authorization": "Bearer " + cfg["ha_token"], "Content-Type": "application/json"}
-BASE = cfg["ha_url"]
+TOKEN = cfg['ha_token']
+BASE = cfg['ha_url']
 
-# TEST 4 : sans channel custom, juste image + actions
-payload = {
-    "title": "TEST 4 - Sans channel",
-    "message": "Notif simple avec image",
-    "data": {
-        "image": "/api/camera_proxy/camera.doorbell_repeater_74a8",
-        "clickAction": "/lovelace/portail",
-        "actions": [
-            {"action": "URI", "title": "Voir le live", "uri": "/lovelace/portail"}
-        ]
-    }
-}
-r = requests.post(BASE + "/api/services/notify/mobile_app_22081212ug",
-                  headers=H, json=payload, timeout=15, verify=False)
-print("TEST 4:", r.status_code, r.text[:200])
+# Utiliser l'API WebSocket pour avoir accès au device_registry et config_entries
+WS_URL = BASE.replace('https://', 'wss://').replace('http://', 'ws://') + '/api/websocket'
+
+try:
+    ws = websocket.create_connection(WS_URL, timeout=15, sslopt={'cert_reqs': 0})
+    # Auth
+    ws.recv()  # auth_required
+    ws.send(json.dumps({'type': 'auth', 'access_token': TOKEN}))
+    auth_ok = json.loads(ws.recv())
+    print('Auth:', auth_ok.get('type'))
+    
+    # Get config entries
+    ws.send(json.dumps({'id': 1, 'type': 'config_entries/get'}))
+    res = json.loads(ws.recv())
+    entries = res.get('result', [])
+    print('\n=== Config entries mobile_app ===')
+    for e in entries:
+        if e.get('domain') == 'mobile_app':
+            print(f"entry_id: {e.get('entry_id')}")
+            print(f"  title: {e.get('title')}")
+            print(f"  state: {e.get('state')}")
+            print(f"  disabled_by: {e.get('disabled_by')}")
+            print()
+    ws.close()
+except Exception as e:
+    print('ERR:', type(e).__name__, e)
