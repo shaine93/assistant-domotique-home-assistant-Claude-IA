@@ -1,33 +1,84 @@
 #!/usr/bin/env python3
-import json, requests, websocket
+import json, requests
 with open('/home/lolufe/assistant/config.json') as f:
     cfg = json.load(f)
-TOKEN = cfg['ha_token']
+H = {'Authorization': 'Bearer ' + cfg['ha_token'], 'Content-Type': 'application/json'}
 BASE = cfg['ha_url']
 
-# Utiliser l'API WebSocket pour avoir accès au device_registry et config_entries
-WS_URL = BASE.replace('https://', 'wss://').replace('http://', 'ws://') + '/api/websocket'
+r = requests.get(BASE + '/api/states/automation.sonnette_g410_popup_mac_notif_xiaomi',
+                 headers=H, timeout=10, verify=False)
+auto_id = r.json().get('attributes', {}).get('id')
 
-try:
-    ws = websocket.create_connection(WS_URL, timeout=15, sslopt={'cert_reqs': 0})
-    # Auth
-    ws.recv()  # auth_required
-    ws.send(json.dumps({'type': 'auth', 'access_token': TOKEN}))
-    auth_ok = json.loads(ws.recv())
-    print('Auth:', auth_ok.get('type'))
-    
-    # Get config entries
-    ws.send(json.dumps({'id': 1, 'type': 'config_entries/get'}))
-    res = json.loads(ws.recv())
-    entries = res.get('result', [])
-    print('\n=== Config entries mobile_app ===')
-    for e in entries:
-        if e.get('domain') == 'mobile_app':
-            print(f"entry_id: {e.get('entry_id')}")
-            print(f"  title: {e.get('title')}")
-            print(f"  state: {e.get('state')}")
-            print(f"  disabled_by: {e.get('disabled_by')}")
-            print()
-    ws.close()
-except Exception as e:
-    print('ERR:', type(e).__name__, e)
+# Popup en fullscreen + style pour que la video remplisse correctement
+new_auto = {
+    'id': auto_id,
+    'alias': 'Sonnette G410 - Popup Mac + Notif Xiaomi',
+    'description': 'Popup full-screen WebRTC + notif Xiaomi',
+    'triggers': [{
+        'entity_id': 'event.doorbell_repeater_74a8_video_doorbell',
+        'not_from': ['unavailable', 'unknown'],
+        'not_to': ['unavailable', 'unknown'],
+        'trigger': 'state'
+    }],
+    'conditions': [{
+        'condition': 'template',
+        'value_template': '{{ this.attributes.last_triggered is none or (now() - this.attributes.last_triggered).total_seconds() > 30 }}'
+    }],
+    'actions': [
+        {
+            'action': 'browser_mod.popup',
+            'data': {
+                'browser_id': ['Mac_Philippe'],
+                'title': 'Quelqu un sonne a la porte',
+                'size': 'fullscreen',
+                'timeout': 90000,
+                'style': '--ha-card-background: black; --primary-background-color: black;',
+                'content': {
+                    'type': 'custom:webrtc-camera',
+                    'url': 'sonnette',
+                    'mode': 'webrtc',
+                    'media': 'video,audio,microphone',
+                    'muted': False,
+                    'ui': True,
+                    'intersection': 0.1,
+                    'background': True,
+                    'style': 'video { object-fit: contain !important; height: 100vh !important; width: 100% !important; }'
+                }
+            }
+        },
+        {
+            'action': 'notify.mobile_app_22081212ug',
+            'data': {
+                'title': 'Sonnette - Quelqu un est a la porte',
+                'message': 'Cliquez pour voir le live',
+                'data': {
+                    'priority': 'high',
+                    'ttl': 0,
+                    'tag': 'doorbell_g410',
+                    'image': '/api/camera_proxy/camera.doorbell_repeater_74a8',
+                    'sticky': 'true',
+                    'color': 'red',
+                    'notification_icon': 'mdi:doorbell-video',
+                    'clickAction': '/lovelace/portail',
+                    'actions': [{'action': 'URI', 'title': 'Voir le live', 'uri': '/lovelace/portail'}]
+                }
+            }
+        }
+    ],
+    'mode': 'single',
+    'max_exceeded': 'silent'
+}
+
+r2 = requests.post(BASE + '/api/config/automation/config/' + auto_id,
+                   headers=H, json=new_auto, timeout=15, verify=False)
+print('UPDATE:', r2.status_code, flush=True)
+r3 = requests.post(BASE + '/api/services/automation/reload', headers=H, json={}, timeout=10, verify=False)
+print('Reload:', r3.status_code, flush=True)
+
+import time
+time.sleep(2)
+r4 = requests.post(BASE + '/api/services/automation/trigger',
+                   headers=H,
+                   json={'entity_id': 'automation.sonnette_g410_popup_mac_notif_xiaomi', 'skip_condition': True},
+                   timeout=10, verify=False)
+print('Trigger:', r4.status_code, flush=True)
