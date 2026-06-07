@@ -3213,3 +3213,43 @@ def transcrire_vocal(file_id):
                 except Exception:
                     pass
 
+# ═════════════════════════════════════════════════════════════════
+# VEILLE INTEGRITE (Patch 07/06/2026)
+# Detection et nettoyage automatique des incoherences au demarrage.
+# Inspire d'un antivirus : scan + quarantaine + log.
+# ═════════════════════════════════════════════════════════════════
+def veille_integrite_au_demarrage():
+    """Audit silencieux des incoherences DB <-> config au demarrage du bot.
+    Nettoie les roles fantomes (en DB mais plus dans ROLES_DEFINIS).
+    Loggue tout dans assistant.log et persiste dans la table memoire.
+    """
+    rapport = {
+        'timestamp': datetime.now().isoformat(),
+        'roles_fantomes_supprimes': [],
+        'erreurs': [],
+    }
+    try:
+        from config import ROLES_DEFINIS
+        conn = sqlite3.connect(DB_PATH, timeout=15.0)
+        cur = conn.execute('SELECT role FROM roles')
+        roles_db = {r[0] for r in cur.fetchall()}
+        fantomes = roles_db - set(ROLES_DEFINIS.keys())
+        for f in fantomes:
+            conn.execute('DELETE FROM roles WHERE role = ?', (f,))
+            rapport['roles_fantomes_supprimes'].append(f)
+        if fantomes:
+            conn.commit()
+        conn.close()
+    except Exception as e:
+        rapport['erreurs'].append(f'roles: {type(e).__name__}: {e}')
+
+    # Log + persist
+    if rapport['roles_fantomes_supprimes'] or rapport['erreurs']:
+        log.warning(f"🛡️ Veille integrite : {len(rapport['roles_fantomes_supprimes'])} fantome(s) nettoye(s) | erreurs: {len(rapport['erreurs'])}")
+        try:
+            mem_set('derniere_veille_integrite', json.dumps(rapport))
+        except Exception:
+            pass
+    else:
+        log.info('🛡️ Veille integrite : RAS')
+    return rapport

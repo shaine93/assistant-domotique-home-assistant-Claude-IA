@@ -591,6 +591,10 @@ def main():
     log.info(f"=== AssistantIA {VERSION} démarrage ===")
 
     init_db()
+    try:
+        shared.veille_integrite_au_demarrage()
+    except Exception as _e:
+        log.warning(f"Veille integrite KO: {_e}")
 
     # ═══ MODE WIZARD : config incomplète → polling Telegram pur ═══
     if _wizard_step():

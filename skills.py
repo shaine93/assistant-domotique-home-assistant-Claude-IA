@@ -260,11 +260,21 @@ def cmd_roles():
         else:
             rapport += f"  ❌ {role} — {desc}\n    Non découvert\n"
 
-    non_assignes = len(ROLES_DEFINIS) - len(roles)
+    # Patch 07/06/2026 : compter uniquement les roles a la fois DEFINIS et TROUVES.
+    # La table SQLite peut contenir des roles obsoletes (fantomes) d'anciennes versions de la config.
+    roles_definis_set = set(ROLES_DEFINIS.keys())
+    roles_trouves_set = set(roles.keys())
+    valides = roles_definis_set & roles_trouves_set
+    fantomes = roles_trouves_set - roles_definis_set
+    non_assignes = len(roles_definis_set) - len(valides)
+
     if non_assignes > 0:
         rapport += f"\n⚠️ {non_assignes} rôle(s) non assigné(s) — /scan pour relancer la découverte"
     else:
         rapport += f"\n✅ Tous les rôles sont assignés"
+
+    if fantomes:
+        rapport += f"\n\n👻 {len(fantomes)} rôle(s) fantôme(s) en DB (obsoletes) : {', '.join(sorted(fantomes))}"
 
     return rapport
 
