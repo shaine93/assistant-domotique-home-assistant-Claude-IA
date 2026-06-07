@@ -551,7 +551,17 @@ def _is_authorized_chat(chat_id):
 
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
+
+    # Patch 07/06/2026 : WAL mode pour eviter "database is locked"
+    # WAL permet lectures + ecritures simultanees sans bloquer.
+    # busy_timeout=15s : retry automatique si autre thread ecrit.
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=15000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
 
     conn.execute('''CREATE TABLE IF NOT EXISTS memoire (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -856,7 +866,7 @@ def init_db():
 
     # ═══ PURGE EXPERTISE DUPLIQUÉE ═══
     try:
-        conn_purge = sqlite3.connect(DB_PATH)
+        conn_purge = sqlite3.connect(DB_PATH, timeout=15.0)
         nb_avant = conn_purge.execute("SELECT COUNT(*) FROM expertise").fetchone()[0]
         if nb_avant > 50:
             # Garder les fondatrices + les 30 meilleurs par confiance
@@ -895,7 +905,7 @@ def init_db():
 
     # ═══ FIX PIÈCE PRISE LAVE-VAISSELLE (cuisine) ═══
     try:
-        conn_piece = sqlite3.connect(DB_PATH)
+        conn_piece = sqlite3.connect(DB_PATH, timeout=15.0)
         nb_fix = conn_piece.execute(
             "UPDATE cartographie SET piece='cuisine' WHERE entity_id LIKE '%lave_vaiselle%' AND (piece IS NULL OR piece='')"
         ).rowcount
@@ -914,7 +924,7 @@ def init_db():
 
     # ═══ PURGE DOUBLONS ÉCHECS HISTORIQUES (fix 20/03/2026) ═══
     try:
-        conn_fix = sqlite3.connect(DB_PATH)
+        conn_fix = sqlite3.connect(DB_PATH, timeout=15.0)
         # Garder 1 seule copie de chaque ECHEC_ historique, supprimer les doublons
         for echec_type in ["ECHEC_nas_faux_positifs", "ECHEC_imprimante_faux_positifs",
                            "ECHEC_silent_mode_spam", "ECHEC_entites_disparues_spam",
@@ -1091,7 +1101,7 @@ def _injecter_lecons_fondatrices(conn_or_path=None):
 
 
 def mem_set(cle, valeur):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     conn.execute(
         'INSERT OR REPLACE INTO memoire (cle, valeur, updated_at) VALUES (?, ?, ?)',
         (cle, str(valeur), datetime.now().isoformat())
@@ -1101,7 +1111,7 @@ def mem_set(cle, valeur):
 
 
 def mem_get(cle, defaut=None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     r = conn.execute('SELECT valeur FROM memoire WHERE cle=?', (cle,)).fetchone()
     conn.close()
     return r[0] if r else defaut
@@ -1109,7 +1119,7 @@ def mem_get(cle, defaut=None):
 
 def log_token_usage(tokens_in, tokens_out):
     mois = datetime.now().strftime("%Y-%m")
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     conn.execute(
         '''INSERT INTO tokens (mois, tokens_in, tokens_out) VALUES (?, ?, ?)
            ON CONFLICT(mois) DO UPDATE SET
@@ -1122,14 +1132,14 @@ def log_token_usage(tokens_in, tokens_out):
 
 def get_token_usage():
     mois = datetime.now().strftime("%Y-%m")
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     r = conn.execute('SELECT tokens_in, tokens_out FROM tokens WHERE mois=?', (mois,)).fetchone()
     conn.close()
     return r if r else (0, 0)
 
 
 def add_historique(role, contenu):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     conn.execute(
         'INSERT INTO historique (role, contenu, created_at) VALUES (?, ?, ?)',
         (role, contenu, datetime.now().isoformat())
@@ -1139,7 +1149,7 @@ def add_historique(role, contenu):
 
 
 def get_historique(n=6):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     rows = conn.execute(
         'SELECT role, contenu FROM historique ORDER BY id DESC LIMIT ?', (n,)
     ).fetchall()
@@ -1152,7 +1162,7 @@ def get_lecons_actives(n=15):
     Limite par défaut à 15 (≈ 800 tokens) pour rester dans le budget tokens.
     """
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=15.0)
         rows = conn.execute(
             'SELECT lecon FROM lecons_apprises WHERE active=1 ORDER BY id DESC LIMIT ?',
             (n,)
@@ -1170,7 +1180,7 @@ def get_lecons_actives(n=15):
 def add_lecon(message_user, reponse_bot, precision_user, lecon):
     """Stocke une nouvelle leçon. Anti-doublon par similarité simple."""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=15.0)
         # Anti-doublon : si une leçon active très similaire existe → ne pas dupliquer
         existantes = conn.execute(
             "SELECT id, lecon FROM lecons_apprises WHERE active=1"
@@ -1223,7 +1233,7 @@ def trace_save(message_user, contexte_taille=0, nb_lecons=0, modele="",
                anomalies=""):
     """Enregistre un tour complet en SQLite. Trim auto à 200 dernières."""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=15.0)
         conn.execute(
             "INSERT INTO tour_trace (ts, message_user, contexte_taille, nb_lecons_injectees, "
             "modele, tools_appeles, reponse_resume, tokens_in, tokens_out, anomalies) "
@@ -1248,7 +1258,7 @@ def trace_save(message_user, contexte_taille=0, nb_lecons=0, modele="",
 def trace_get_dernier():
     """Retourne le dernier tour tracé sous forme de dict, ou None."""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=15.0)
         row = conn.execute(
             "SELECT ts, message_user, contexte_taille, nb_lecons_injectees, "
             "modele, tools_appeles, reponse_resume, tokens_in, tokens_out, anomalies "
@@ -1274,7 +1284,7 @@ def trace_get_dernier():
 def trace_get_recents(n=10):
     """Retourne les N derniers tours tracés."""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=15.0)
         rows = conn.execute(
             "SELECT ts, message_user, modele, tools_appeles, reponse_resume, "
             "tokens_in, tokens_out, anomalies FROM tour_trace "
@@ -1328,7 +1338,7 @@ def anomalie_log(type_anomalie, severite, details="", message_user="",
     if severite not in _SEVERITES:
         severite = "info"
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=15.0)
         conn.execute(
             "INSERT INTO anomalies_auto (ts, type, severite, message_user, details, "
             "modele, tokens_in, tokens_out) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1382,7 +1392,7 @@ def _verifier_seuil_notification(type_anomalie, severite, details="", message_us
         
         # Compter occurrences récentes
         seuil_ts = (datetime.now() - timedelta(minutes=fenetre_min)).isoformat()
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=15.0)
         nb_occ = conn.execute(
             "SELECT COUNT(*) FROM anomalies_auto WHERE type=? AND ts >= ?",
             (type_anomalie, seuil_ts)
@@ -1454,7 +1464,7 @@ def anomalies_recentes(n=50, depuis_heures=24):
     try:
         from datetime import datetime, timedelta
         seuil_ts = (datetime.now() - timedelta(hours=depuis_heures)).isoformat()
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=15.0)
         rows = conn.execute(
             "SELECT ts, type, severite, message_user, details, modele, tokens_in, tokens_out "
             "FROM anomalies_auto WHERE ts >= ? ORDER BY id DESC LIMIT ?",
@@ -1471,7 +1481,7 @@ def anomalies_groupees(depuis_heures=24):
     try:
         from datetime import datetime, timedelta
         seuil_ts = (datetime.now() - timedelta(hours=depuis_heures)).isoformat()
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=15.0)
         rows = conn.execute(
             "SELECT type, COUNT(*) as nb, MAX(ts) as derniere_ts, "
             "GROUP_CONCAT(DISTINCT severite) as severites "
@@ -1486,7 +1496,7 @@ def anomalies_groupees(depuis_heures=24):
 
 
 def cartographie_get(entity_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     r = conn.execute(
         'SELECT categorie, sous_categorie, piece FROM cartographie WHERE entity_id=?',
         (entity_id,)
@@ -1496,7 +1506,7 @@ def cartographie_get(entity_id):
 
 
 def cartographie_get_par_categorie(categorie):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     rows = conn.execute(
         'SELECT entity_id, sous_categorie, piece FROM cartographie WHERE categorie=?',
         (categorie,)
@@ -1506,21 +1516,21 @@ def cartographie_get_par_categorie(categorie):
 
 
 def cartographie_get_toutes_categories():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     rows = conn.execute('SELECT DISTINCT categorie FROM cartographie').fetchall()
     conn.close()
     return [r[0] for r in rows]
 
 
 def cartographie_get_toutes():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     rows = conn.execute('SELECT entity_id, categorie FROM cartographie').fetchall()
     conn.close()
     return {r[0]: r[1] for r in rows}
 
 
 def batterie_set(entity_id, piece, valeur):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     conn.execute(
         '''INSERT OR REPLACE INTO batteries
            (entity_id, piece, derniere_valeur, updated_at)
@@ -1532,7 +1542,7 @@ def batterie_set(entity_id, piece, valeur):
 
 
 def batterie_get_derniere_alerte(entity_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     r = conn.execute(
         'SELECT derniere_alerte FROM batteries WHERE entity_id=?', (entity_id,)
     ).fetchone()
@@ -1541,7 +1551,7 @@ def batterie_get_derniere_alerte(entity_id):
 
 
 def batterie_set_alerte(entity_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     conn.execute(
         'UPDATE batteries SET derniere_alerte=? WHERE entity_id=?',
         (datetime.now().isoformat(), entity_id)
@@ -1552,7 +1562,7 @@ def batterie_set_alerte(entity_id):
 
 def role_get(role):
     """Retourne l'entity_id assigné à un rôle, ou None"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     r = conn.execute("SELECT entity_id FROM roles WHERE role=?", (role,)).fetchone()
     conn.close()
     return r[0] if r else None
@@ -1560,7 +1570,7 @@ def role_get(role):
 
 def role_set(role, entity_id, source="auto", confiance=0.5):
     """Assigne un entity_id à un rôle"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     conn.execute(
         "INSERT OR REPLACE INTO roles (role, entity_id, confiance, source, updated_at) VALUES (?, ?, ?, ?, ?)",
         (role, entity_id, confiance, source, datetime.now().isoformat())
@@ -1572,7 +1582,7 @@ def role_set(role, entity_id, source="auto", confiance=0.5):
 
 def role_get_all():
     """Retourne tous les rôles assignés"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     rows = conn.execute("SELECT role, entity_id, confiance FROM roles").fetchall()
     conn.close()
     return {r[0]: {"entity_id": r[1], "confiance": r[2]} for r in rows}
@@ -1694,7 +1704,7 @@ def role_decouvrir_baselines():
 
 
 def entites_connues_maj(entity_id, categorie):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     conn.execute(
         '''INSERT OR REPLACE INTO entites_connues
            (entity_id, categorie, vu_la_derniere_fois)
@@ -1706,7 +1716,7 @@ def entites_connues_maj(entity_id, categorie):
 
 
 def entites_connues_get_toutes():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     rows = conn.execute('SELECT entity_id, categorie FROM entites_connues').fetchall()
     conn.close()
     return {r[0]: r[1] for r in rows}
@@ -1715,7 +1725,7 @@ def entites_connues_get_toutes():
 def appareil_get(entity_id):
     """Retourne le type d'appareil pour une prise, ou None si pas encore identifié."""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=15.0)
         row = conn.execute(
             "SELECT type_appareil, nom_personnalise, surveiller FROM appareils WHERE entity_id=?",
             (entity_id,)
@@ -1734,7 +1744,7 @@ def appareil_set(entity_id, type_appareil, nom=None):
     if not nom:
         nom = TYPES_APPAREILS.get(type_appareil, type_appareil)
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=15.0)
         conn.execute(
             "INSERT OR REPLACE INTO appareils (entity_id, type_appareil, nom_personnalise, surveiller, created_at) VALUES (?, ?, ?, ?, ?)",
             (entity_id, type_appareil, nom, surveiller, datetime.now().isoformat())
@@ -1749,7 +1759,7 @@ def appareil_set(entity_id, type_appareil, nom=None):
 def enregistrer_economie(type_eco, description, euros, kwh=0, source="auto"):
     """Enregistre une économie dans la table economies + log succès."""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=15.0)
         conn.execute(
             "INSERT INTO economies (type, description, euros, kwh_economises, source, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (type_eco, description, round(euros, 4), round(kwh, 4), source, datetime.now().isoformat())
@@ -1770,7 +1780,7 @@ def get_economies_mois(mois=None):
     if not mois:
         mois = datetime.now().strftime("%Y-%m")
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=15.0)
         row = conn.execute(
             "SELECT COALESCE(SUM(euros), 0), COALESCE(SUM(kwh_economises), 0), COUNT(*) "
             "FROM economies WHERE created_at LIKE ?",
@@ -1791,7 +1801,7 @@ def get_economies_mois(mois=None):
 
 
 def zigbee_absence_creer(entity_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     conn.execute(
         '''INSERT OR REPLACE INTO zigbee_absences
            (entity_id, hors_ligne_depuis, statut, alerte_envoyee)
@@ -1803,7 +1813,7 @@ def zigbee_absence_creer(entity_id):
 
 
 def zigbee_absence_get(entity_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     r = conn.execute(
         'SELECT hors_ligne_depuis, statut FROM zigbee_absences WHERE entity_id=? AND retour_en_ligne IS NULL',
         (entity_id,)
@@ -1813,7 +1823,7 @@ def zigbee_absence_get(entity_id):
 
 
 def zigbee_absence_statut(entity_id, statut):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     conn.execute(
         'UPDATE zigbee_absences SET statut=? WHERE entity_id=? AND retour_en_ligne IS NULL',
         (statut, entity_id)
@@ -1823,7 +1833,7 @@ def zigbee_absence_statut(entity_id, statut):
 
 
 def zigbee_absence_retour(entity_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     r = conn.execute(
         'SELECT statut FROM zigbee_absences WHERE entity_id=? AND retour_en_ligne IS NULL',
         (entity_id,)
@@ -1860,7 +1870,7 @@ def telegram_send(text, parse_mode=None, force=False):
     if not force:
         # ═══ FILTRE 1 : PATTERNS APPRIS (SQLite) ═══
         try:
-            conn_f = sqlite3.connect(DB_PATH)
+            conn_f = sqlite3.connect(DB_PATH, timeout=15.0)
             patterns = conn_f.execute(
                 "SELECT pattern, raison FROM filtre_messages WHERE actif=1 AND action='bloquer'"
             ).fetchall()
@@ -1913,7 +1923,7 @@ def telegram_send(text, parse_mode=None, force=False):
 
     # ═══ LOGUER (envoyé ou filtré) ═══
     try:
-        conn_log = sqlite3.connect(DB_PATH)
+        conn_log = sqlite3.connect(DB_PATH, timeout=15.0)
         conn_log.execute(
             "INSERT INTO messages_log (message, envoye, raison_filtre, created_at) VALUES (?, ?, ?, ?)",
             (text[:500], 0 if raison_filtre else 1, raison_filtre, now_ts.isoformat())
@@ -1954,7 +1964,7 @@ def telegram_send(text, parse_mode=None, force=False):
 def filtre_apprendre_pattern(pattern, raison, action="bloquer"):
     """L'IA apprend un nouveau pattern de filtrage"""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=15.0)
         conn.execute(
             "INSERT OR REPLACE INTO filtre_messages (pattern, action, raison, nb_applique, actif, created_at, updated_at) "
             "VALUES (?, ?, ?, 0, 1, ?, ?)",
@@ -1974,7 +1984,7 @@ def filtre_analyser_messages():
     if not verifier_budget():
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
 
     # Messages filtrés (les patterns qui marchent)
     filtres = conn.execute(
@@ -2352,7 +2362,7 @@ def _alerter_si_nouveau(cle, message, delai_h=2):
 
 def skill_get(nom):
     """Lit un skill depuis SQLite"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     r = conn.execute("SELECT donnees, nb_apprentissages FROM skills WHERE nom=?", (nom,)).fetchone()
     conn.close()
     if r:
@@ -2362,7 +2372,7 @@ def skill_get(nom):
 
 def skill_set(nom, donnees, nb=None):
     """Écrit un skill dans SQLite"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     ancien = conn.execute("SELECT nb_apprentissages FROM skills WHERE nom=?", (nom,)).fetchone()
     nb_val = nb if nb is not None else ((ancien[0] + 1) if ancien else 1)
     conn.execute(
@@ -2644,7 +2654,7 @@ def appel_claude(message_utilisateur, contexte_ha=None):
         # Purger l'historique conversationnel — un shortcut signifie "on repart à zéro"
         # Évite que Claude continue une tâche précédente non résolue.
         try:
-            _conn = sqlite3.connect(DB_PATH)
+            _conn = sqlite3.connect(DB_PATH, timeout=15.0)
             _n = _conn.execute("SELECT COUNT(*) FROM historique").fetchone()[0]
             _conn.execute("DELETE FROM historique")
             _conn.commit()
@@ -2880,7 +2890,7 @@ def appel_claude(message_utilisateur, contexte_ha=None):
                 message = watch_demandee.get("message", "")
                 cooldown = watch_demandee.get("cooldown_min", 60)
 
-                conn = sqlite3.connect(DB_PATH)
+                conn = sqlite3.connect(DB_PATH, timeout=15.0)
                 conn.execute(
                     "INSERT INTO watches (entity_pattern, condition, state_value, message, cooldown_min, created_at) "
                     "VALUES (?, ?, ?, ?, ?, ?)",

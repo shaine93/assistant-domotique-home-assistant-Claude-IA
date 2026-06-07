@@ -224,16 +224,38 @@ FOURNISSEURS = {
 
 
 def cmd_roles():
-    """Affiche les rôles découverts"""
+    """Affiche les rôles découverts.
+    Patch 07/06/2026 : ROLES_DEFINIS structure = {role: [patterns]} (liste de patterns),
+    pas {role: {description: ...}}. Adapte le rendu en consequence.
+    """
     roles = role_get_all()
     rapport = f"🎯 RÔLES AUTO-DÉCOUVERTS — {len(roles)}/{len(ROLES_DEFINIS)}\n━━━━━━━━━━━━━━━━━━\n"
 
     for role, definition in ROLES_DEFINIS.items():
-        desc = definition["description"]
+        # Compatibilite : definition peut etre soit une liste de patterns (cas actuel)
+        # soit un dict {description, ...} (ancien format)
+        if isinstance(definition, dict):
+            desc = definition.get("description", "")
+        elif isinstance(definition, list):
+            # Liste de patterns : on prend le 1er comme indication
+            desc = f"patterns: {', '.join(definition[:2])}"
+        else:
+            desc = str(definition)[:80]
+
         if role in roles:
-            eid = roles[role]["entity_id"]
-            conf = roles[role]["confiance"]
-            etoiles = "★" * min(5, int(conf * 5)) + "☆" * (5 - min(5, int(conf * 5)))
+            entry = roles[role]
+            # Compatibilite : entry peut etre dict ou tuple
+            if isinstance(entry, dict):
+                eid = entry.get("entity_id", "?")
+                conf = entry.get("confiance", 0.0)
+            elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                eid = entry[0]
+                conf = entry[1] if isinstance(entry[1], (int, float)) else 0.0
+            else:
+                eid = str(entry)
+                conf = 0.0
+            etoiles_pleines = max(0, min(5, int(conf * 5)))
+            etoiles = "★" * etoiles_pleines + "☆" * (5 - etoiles_pleines)
             rapport += f"  ✅ {role}\n    {etoiles} {eid}\n"
         else:
             rapport += f"  ❌ {role} — {desc}\n    Non découvert\n"
@@ -8745,35 +8767,84 @@ def cmd_zigbee():
         return "❌ ZIGBEE — HA inaccessible"
     index = {e["entity_id"]: e for e in etats}
 
-    # Collecter TOUS les devices Zigbee via linkquality
+    # Patch 07/06/2026 : utilise le device_registry HA (via WebSocket)
+    # car HA ne pousse plus linkquality dans les attributs entities.
+    # Approche fiable : tous les devices Z2M sont identifies par ('mqtt', ...).
     devices = []  # (eid, fname, piece, lqi, state)
-    seen_devices = set()  # Éviter doublons par device physique
-    for e in etats:
-        lqi = e.get("attributes", {}).get("linkquality")
-        if lqi is None:
-            continue
-        eid = e["entity_id"]
-        # Dédupliquer par préfixe device (sensor.prise_X et switch.prise_X = même device)
-        device_key = eid.split(".", 1)[1] if "." in eid else eid
-        # Normaliser : prendre la première entité rencontrée par device
-        base_key = device_key
-        for suffix in ["_power", "_current", "_voltage", "_energy", "_puissance", "_battery"]:
-            if base_key.endswith(suffix):
-                base_key = base_key[:-len(suffix)]
-                break
-        if base_key in seen_devices:
-            continue
-        seen_devices.add(base_key)
-
-        attrs = e.get("attributes", {})
-        fname = attrs.get("friendly_name", eid)
-        carto = cartographie_get(eid)
-        piece = carto[2] if carto else ""
+    try:
+        import ssl
+        import websocket as _ws
+    except Exception:
         try:
-            lqi_val = int(lqi)
+            import subprocess
+            subprocess.run(["pip3", "install", "--quiet", "--break-system-packages",
+                            "websocket-client"], check=False)
+            import websocket as _ws
+            import ssl
         except Exception:
-            lqi_val = -1
-        devices.append((eid, fname, piece, lqi_val, e["state"]))
+            return "❌ ZIGBEE — module websocket-client manquant"
+
+    try:
+        cfg = CFG
+        ws_url = cfg["ha_url"].replace("https://", "wss://").replace("http://", "ws://") + "/api/websocket"
+        ws = _ws.create_connection(ws_url, timeout=20, sslopt={"cert_reqs": ssl.CERT_NONE})
+        ws.recv()
+        import json as _json
+        ws.send(_json.dumps({"type": "auth", "access_token": cfg["ha_token"]}))
+        ws.recv()
+        ws.send(_json.dumps({"id": 1, "type": "config/device_registry/list"}))
+        devs = _json.loads(ws.recv()).get("result", [])
+        ws.send(_json.dumps({"id": 2, "type": "config/entity_registry/list"}))
+        ents = _json.loads(ws.recv()).get("result", [])
+        ws.close()
+    except Exception as ex:
+        return f"❌ ZIGBEE — WebSocket KO: {ex}"
+
+    # Filtrer devices Z2M (identifiers commencent par 'mqtt')
+    z2m_devs = []
+    for dv in devs:
+        for tup in dv.get("identifiers", []) or []:
+            if tup and len(tup) >= 1 and tup[0] == "mqtt":
+                z2m_devs.append(dv)
+                break
+
+    # Mapper device_id -> entites
+    ents_by_dev = {}
+    for ent in ents:
+        did = ent.get("device_id")
+        if did:
+            ents_by_dev.setdefault(did, []).append(ent.get("entity_id"))
+
+    # Pour chaque device, etat agrege + linkquality si dispo
+    for dv in z2m_devs:
+        did = dv["id"]
+        name = dv.get("name_by_user") or dv.get("name") or "?"
+        dv_ents = ents_by_dev.get(did, [])
+        if not dv_ents:
+            continue
+        # Etat agrege : si toutes les entites sont unavailable => offline
+        states_list = [index.get(e, {}).get("state") for e in dv_ents]
+        real_states = [s for s in states_list if s and s != "missing"]
+        if real_states and all(s in ("unavailable", "unknown") for s in real_states):
+            state = "unavailable"
+        else:
+            state = "ok"
+        # LQI : prendre le premier disponible
+        lqi_val = -1
+        for e in dv_ents:
+            ent_state = index.get(e, {})
+            lqi = ent_state.get("attributes", {}).get("linkquality")
+            if lqi is not None:
+                try:
+                    lqi_val = int(lqi)
+                    break
+                except Exception:
+                    pass
+        # Piece via cartographie sur la premiere entite
+        first_eid = dv_ents[0] if dv_ents else ""
+        carto = cartographie_get(first_eid)
+        piece = carto[2] if carto and len(carto) > 2 else ""
+        devices.append((first_eid, name, piece, lqi_val, state))
 
     # Trier par LQI croissant (les plus faibles en premier)
     devices.sort(key=lambda x: x[3])

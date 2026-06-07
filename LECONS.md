@@ -212,3 +212,38 @@ costs:
 - Quel format d'API recorder utiliser : la doc HA officielle est ici → https://www.home-assistant.io/docs/configuration/state_object/
 
 ---
+
+
+## 📡 Z2M v2+ : linkquality n'est plus exposé en attribut (07/06/2026)
+
+**Symptôme :** `/zigbee` retourne "0 devices — Tous en ligne" alors que ~40 devices Zigbee tournent.
+
+**Cause :** Depuis Zigbee2MQTT v2.0+ (et HA 2025.2+), l'attribut `linkquality` n'est plus
+inclus dans les attributs des sensors. Il est soit dans une entité séparée
+`sensor.<device>_linkquality` (souvent désactivée par défaut), soit absent.
+
+**Diagnostic factuel :**
+```python
+etats = ha_get('states')
+with_lqi = [e for e in etats if e.get('attributes', {}).get('linkquality') is not None]
+# → len(with_lqi) == 0 alors qu'il y a 38 devices Z2M
+```
+
+**Solution validée :** Ne PAS se baser sur `linkquality`. Utiliser le `device_registry`
+HA via WebSocket pour identifier les devices Z2M (identifiers tuples `('mqtt', ...)`).
+
+```python
+import websocket, ssl, json
+ws = websocket.create_connection(WS_URL, sslopt={'cert_reqs': ssl.CERT_NONE})
+ws.recv(); ws.send(json.dumps({'type':'auth','access_token':TOKEN})); ws.recv()
+ws.send(json.dumps({'id':1,'type':'config/device_registry/list'}))
+devs = json.loads(ws.recv()).get('result',[])
+z2m_devs = [d for d in devs if any(t and t[0]=='mqtt' for t in d.get('identifiers',[]))]
+```
+
+**Patch fait :** `cmd_zigbee()` dans skills.py (commit du 07/06/2026).
+
+**Règle générale appliquée (CDC #11) :**
+1. Reproduire en isolation (`/tmp/d.py`) avant de patcher
+2. Web search release notes / forums pour breaking changes
+3. Préférer source de vérité (device_registry) aux attributs volatils
