@@ -863,6 +863,22 @@ def init_db():
     log.info("✅ Base de données initialisée")
 
     # Auto-déverrouillage garanti : dernier_deverrouillage en SQLite (24h)
+    # Patch 12/06/2026 : logique manquante (le commentaire existait sans code).
+    # Si le canal a ete deverrouille il y a moins de 24h, on le rouvre au demarrage
+    # pour ne pas exiger un /sms a chaque redemarrage (utile en phase de debug/patch).
+    global canal_verrouille
+    try:
+        dernier = mem_get("dernier_deverrouillage")
+        if dernier:
+            delta = (datetime.now() - datetime.fromisoformat(dernier)).total_seconds()
+            if delta < 24 * 3600:
+                canal_verrouille = False
+                heures = delta / 3600
+                log.info(f"🔓 Canal auto-déverrouillé (dernier déverrouillage il y a {heures:.1f}h < 24h)")
+            else:
+                log.info(f"🔒 Canal verrouillé (dernier déverrouillage il y a {delta/3600:.1f}h > 24h)")
+    except Exception as e_unlock:
+        log.error(f"Auto-déverrouillage: {e_unlock}")
 
     # ═══ PURGE EXPERTISE DUPLIQUÉE ═══
     try:
