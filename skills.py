@@ -26,6 +26,7 @@ _SERVICE_STARTED_AT = datetime.now()
 # Stdlib imports AFTER wildcard
 import json, logging, os, re, random, requests, sqlite3, time, threading
 import hashlib, hmac, anthropic
+import urllib.request  # Patch 12/06/2026 : manquait — _auto_guerison et _proposer_guerison plantaient sur urllib.request
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 
@@ -1465,6 +1466,89 @@ def traiter_callback(callback_query):
     if data == "auto_cancel":
         mem_set("ha_automation_pending", "")
         telegram_send("❌ Automatisation annulée.")
+        return
+
+    # ═══ PATCH PROPOSÉ — Appliquer / Ignorer (chantier 12/06/2026) ═══
+    if data == "patch_apply":
+        pending = mem_get("guerison_pending")
+        if not pending:
+            telegram_send("⚠️ Aucun patch en attente (déjà appliqué ou expiré).")
+            return
+        try:
+            p = json.loads(pending)
+            old_str = p["old_str"]
+            new_str = p["new_str"]
+            explication = p.get("explication", "")
+            signature = p.get("signature", "")
+        except Exception as e:
+            telegram_send(f"❌ Patch illisible : {e}")
+            mem_set("guerison_pending", "")
+            return
+
+        # Appliquer via deploy_server /patch (backup auto inclus)
+        try:
+            cfg_secret = CFG.get("deploy_secret", "")
+            payload = json.dumps({"mode": "replace", "old_str": old_str, "new_str": new_str}).encode()
+            sig = hmac.new(cfg_secret.encode(), payload, hashlib.sha256).hexdigest()
+            req_p = urllib.request.Request("http://localhost:8501/patch", data=payload, method="POST")
+            req_p.add_header("Content-Type", "application/json")
+            req_p.add_header("Authorization", f"HMAC {sig}")
+            resp_p = urllib.request.urlopen(req_p, timeout=15)
+            result = json.loads(resp_p.read().decode())
+        except Exception as e:
+            telegram_send(f"❌ Application échouée : {e}")
+            return
+
+        if result.get("status") != "ok":
+            telegram_send(f"❌ Patch refusé : {result.get('message', '?')}")
+            return
+
+        # Log decisions_log + nettoyage
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=15.0)
+            conn.execute(
+                "INSERT INTO decisions_log (action, contexte, resultat, succes, created_at) VALUES (?, ?, ?, ?, ?)",
+                ("PATCH_VALIDE", json.dumps({"sig": signature, "expl": explication[:80]}, ensure_ascii=False),
+                 result.get("backup", "ok"), 1, datetime.now().isoformat())
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+        mem_set("guerison_pending", "")
+        telegram_send(f"✅ Patch appliqué : {explication[:120]}\n🔄 Redémarrage en cours…")
+
+        # Restart
+        try:
+            payload_r = json.dumps({"action": "restart"}).encode()
+            sig_r = hmac.new(cfg_secret.encode(), payload_r, hashlib.sha256).hexdigest()
+            req_restart = urllib.request.Request("http://localhost:8501/restart", data=payload_r, method="POST")
+            req_restart.add_header("Content-Type", "application/json")
+            req_restart.add_header("Authorization", f"HMAC {sig_r}")
+            urllib.request.urlopen(req_restart, timeout=15)
+        except Exception:
+            pass  # restart tue le process
+        return
+
+    if data == "patch_ignore":
+        pending = mem_get("guerison_pending")
+        if pending:
+            try:
+                p = json.loads(pending)
+                signature = p.get("signature", "")
+                # Log comme tentative ignorée → anti-boucle (deja_tente)
+                conn = sqlite3.connect(DB_PATH, timeout=15.0)
+                conn.execute(
+                    "INSERT INTO decisions_log (action, contexte, resultat, succes, created_at) VALUES (?, ?, ?, ?, ?)",
+                    ("PATCH_IGNORE", json.dumps({"sig": signature}, ensure_ascii=False),
+                     "ignore_par_user", 0, datetime.now().isoformat())
+                )
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+        mem_set("guerison_pending", "")
+        telegram_send("❌ Patch ignoré. Pas de nouvelle proposition pour cette erreur avant 24h.")
         return
 
     # ═══ ACTIONS HA — Confirmation / Annulation ═══
@@ -3428,8 +3512,14 @@ def _remonter_erreurs():
             continue
 
         try:
-            resultat = _auto_guerison(sig, info["msg"])
-            action_db = "AUTO_FIX_OK" if resultat == "OK" else "AUTO_FIX_FAIL"
+            if MODE_PROPOSITION:
+                # Mode force de proposition : propose sur Telegram, n'applique rien
+                resultat = _proposer_guerison(sig, info["msg"], nb_1h)
+                action_db = "PATCH_PROPOSE" if resultat == "PROPOSE" else f"PROPOSE_{resultat}"
+            else:
+                # Ancien mode : auto-guérison silencieuse
+                resultat = _auto_guerison(sig, info["msg"])
+                action_db = "AUTO_FIX_OK" if resultat == "OK" else "AUTO_FIX_FAIL"
             try:
                 conn2 = sqlite3.connect(DB_PATH)
                 conn2.execute(
@@ -3441,8 +3531,8 @@ def _remonter_erreurs():
                 conn2.close()
             except Exception:
                 pass
-            if resultat == "FAIL":
-                # Retry avec plus de contexte (logs élargis)
+            if resultat == "FAIL" and not MODE_PROPOSITION:
+                # Retry avec plus de contexte (logs élargis) — uniquement en mode auto
                 _auto_guerison(sig, info["msg"], nb_occurrences, retry=True)
         except Exception:
             pass
@@ -3450,6 +3540,150 @@ def _remonter_erreurs():
     # Nettoyer les vieilles signatures
     cutoff = (now - timedelta(hours=24)).isoformat()
     _erreurs_vues = {k: v for k, v in _erreurs_vues.items() if v > cutoff}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MODE PROPOSITION (chantier 12/06/2026) — Force de proposition
+# Au lieu d'appliquer un patch en silence, le bot propose le patch sur
+# Telegram avec boutons [Appliquer] [Ignorer] + cout en tokens.
+# Reutilise l'infra existante : backup auto (/file, /patch), budget,
+# decisions_log (anti-boucle deja_tente), telegram_send_buttons.
+# ═══════════════════════════════════════════════════════════════════
+MODE_PROPOSITION = True  # True = propose et attend validation. False = auto-guerison silencieuse (ancien comportement).
+
+
+def _proposer_guerison(signature, message_erreur, nb_occurrences=2):
+    """Prepare un patch Sonnet et l'envoie en PROPOSITION sur Telegram.
+    N'applique RIEN. Stocke le patch dans memoire (cle guerison_pending)
+    pour qu'un callback [Appliquer] puisse l'appliquer ensuite.
+    Retourne 'PROPOSE', 'SKIP' ou 'FAIL'."""
+    msg_clean = message_erreur
+    if "] " in msg_clean:
+        msg_clean = msg_clean.split("] ", 1)[-1]
+
+    # 1. Lire le script assistant.py via deploy_server local
+    try:
+        cfg_secret = CFG.get("deploy_secret", "")
+        req_r = urllib.request.Request("http://localhost:8501/read")
+        req_r.add_header("Authorization", f"Bearer {cfg_secret}")
+        resp_r = urllib.request.urlopen(req_r, timeout=15)
+        script_data = json.loads(resp_r.read().decode())
+        script_code = script_data["content"]
+        script_lines = script_data["lines"]
+    except Exception as e:
+        log.error(f"proposition: lecture script: {e}")
+        return "FAIL"
+
+    # 2. Contexte pertinent (lignes autour du pattern d'erreur)
+    erreur_mots = [m for m in msg_clean.split() if len(m) > 4][:5]
+    lignes_script = script_code.split("\n")
+    lignes_pertinentes = set()
+    for i, ligne in enumerate(lignes_script):
+        if any(mot in ligne for mot in erreur_mots):
+            for j in range(max(0, i - 30), min(len(lignes_script), i + 30)):
+                lignes_pertinentes.add(j)
+    if not lignes_pertinentes:
+        contexte = "\n".join(f"L{i+1}: {l}" for i, l in enumerate(lignes_script[:400]))
+        contexte += "\n...\n"
+        contexte += "\n".join(f"L{i+1}: {l}" for i, l in enumerate(lignes_script[-400:], len(lignes_script) - 400))
+    else:
+        indices = sorted(lignes_pertinentes)
+        contexte = "\n".join(f"L{i+1}: {lignes_script[i]}" for i in indices)
+
+    # 3. Demander un patch a Sonnet
+    try:
+        client = anthropic.Anthropic(api_key=CFG["anthropic_api_key"])
+        r = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4000,
+            system=(
+                "Tu es le systeme de diagnostic d'un script Python (assistant.py, "
+                f"{script_lines} lignes).\n"
+                "Une erreur recurrente survient. Tu proposes UN patch chirurgical minimal.\n\n"
+                "FORMAT — JSON brut uniquement :\n"
+                '{"old_str": "code_exact", "new_str": "nouveau_code", "explication": "ce_que_corrige_le_patch"}\n\n'
+                "REGLES :\n"
+                "- old_str = copie EXACTE (espaces, indentation, guillemets identiques)\n"
+                "- old_str doit apparaitre 1 SEULE FOIS\n"
+                "- Change le MINIMUM (try/except, valeur par defaut, guard clause)\n"
+                "- PAS de markdown, PAS de ```, PAS de texte avant/apres"
+            ),
+            messages=[{"role": "user", "content":
+                f"ERREUR RECURRENTE ({nb_occurrences}x) :\n{msg_clean[:300]}\n\n"
+                f"CONTEXTE DU SCRIPT :\n{contexte[:15000]}"
+            }]
+        )
+        reponse = r.content[0].text.strip()
+        tok_in = r.usage.input_tokens
+        tok_out = r.usage.output_tokens
+        log_token_usage(tok_in, tok_out)
+    except Exception as e:
+        log.error(f"proposition: Sonnet: {e}")
+        return "FAIL"
+
+    # 4. Parser le patch
+    try:
+        texte = reponse.replace("```json", "").replace("```", "").strip()
+        idx_start = texte.find("{")
+        idx_end = texte.rfind("}") + 1
+        if idx_start >= 0 and idx_end > idx_start:
+            texte = texte[idx_start:idx_end]
+        patch = json.loads(texte)
+        old_str = patch.get("old_str", "")
+        new_str = patch.get("new_str", "")
+        explication = patch.get("explication", "")
+    except Exception as ex_json:
+        log.error(f"proposition: JSON invalide ({ex_json})")
+        return "FAIL"
+
+    if not old_str:
+        log.info(f"proposition: Sonnet ne peut pas corriger — {explication[:100]}")
+        return "SKIP"
+
+    # 5. Verifier unicite dans le script
+    if script_code.count(old_str) != 1:
+        log.error(f"proposition: old_str trouve {script_code.count(old_str)} fois")
+        return "FAIL"
+
+    # 6. Stocker le patch en attente (PAS d'application)
+    cout_eur = (tok_in / 1_000_000) * 3 + (tok_out / 1_000_000) * 15
+    pending = {
+        "signature": signature[:80],
+        "old_str": old_str,
+        "new_str": new_str,
+        "explication": explication,
+        "tokens_in": tok_in,
+        "tokens_out": tok_out,
+        "cout_eur": round(cout_eur, 4),
+        "ts": datetime.now().isoformat(),
+    }
+    try:
+        mem_set("guerison_pending", json.dumps(pending, ensure_ascii=False))
+    except Exception as e:
+        log.error(f"proposition: stockage pending: {e}")
+        return "FAIL"
+
+    # 7. Construire le diff lisible + envoyer la proposition
+    diff_old = old_str if len(old_str) <= 400 else old_str[:400] + "…"
+    diff_new = new_str if len(new_str) <= 400 else new_str[:400] + "…"
+    texte_msg = (
+        f"🔧 *PATCH PROPOSÉ — auto-diagnostic*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ Erreur récurrente ({nb_occurrences}x) :\n"
+        f"`{msg_clean[:200]}`\n\n"
+        f"🩹 Correction proposée :\n{explication[:300]}\n\n"
+        f"➖ Avant :\n`{diff_old}`\n\n"
+        f"➕ Après :\n`{diff_new}`\n\n"
+        f"💰 Coût analyse : {tok_in}+{tok_out} tokens (~{cout_eur:.4f}€)\n\n"
+        f"Appliquer ce patch ?"
+    )
+    boutons = [
+        {"text": "✅ Appliquer", "callback_data": "patch_apply"},
+        {"text": "❌ Ignorer", "callback_data": "patch_ignore"},
+    ]
+    telegram_send_buttons(texte_msg, boutons)
+    log.info(f"🔧 Patch proposé sur Telegram : {explication[:80]}")
+    return "PROPOSE"
 
 
 def _auto_guerison(signature, message_erreur, nb_occurrences=2, retry=False):
