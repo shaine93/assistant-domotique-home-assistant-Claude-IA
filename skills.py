@@ -1480,6 +1480,7 @@ def traiter_callback(callback_query):
             new_str = p["new_str"]
             explication = p.get("explication", "")
             signature = p.get("signature", "")
+            target_file = p.get("target", "assistant.py")
         except Exception as e:
             telegram_send(f"❌ Patch illisible : {e}")
             mem_set("guerison_pending", "")
@@ -1489,7 +1490,7 @@ def traiter_callback(callback_query):
         try:
             import urllib.request  # import local : garantit la visibilité dans ce scope
             cfg_secret = CFG.get("deploy_secret", "")
-            payload = json.dumps({"mode": "replace", "old_str": old_str, "new_str": new_str}).encode()
+            payload = json.dumps({"mode": "replace", "target": target_file, "old_str": old_str, "new_str": new_str}).encode()
             sig = hmac.new(cfg_secret.encode(), payload, hashlib.sha256).hexdigest()
             req_p = urllib.request.Request("http://localhost:8501/patch", data=payload, method="POST")
             req_p.add_header("Content-Type", "application/json")
@@ -3563,18 +3564,27 @@ def _proposer_guerison(signature, message_erreur, nb_occurrences=2):
     if "] " in msg_clean:
         msg_clean = msg_clean.split("] ", 1)[-1]
 
-    # 1. Lire le script assistant.py via deploy_server local
+    # 1. Détecter le fichier cible depuis le message d'erreur (traceback)
+    #    Patch 13/06/2026 : multi-fichiers. Le traceback contient File ".../skills.py"
+    target_file = "assistant.py"  # défaut
+    for f in ("skills.py", "shared.py", "assistant.py"):
+        if f in message_erreur:
+            target_file = f
+            break
+
+    # Lire le BON fichier via deploy_server local
     try:
         import urllib.request  # import local : visibilité garantie dans ce scope
         cfg_secret = CFG.get("deploy_secret", "")
-        req_r = urllib.request.Request("http://localhost:8501/read")
+        read_path = "/read" if target_file == "assistant.py" else f"/read/{target_file}"
+        req_r = urllib.request.Request(f"http://localhost:8501{read_path}")
         req_r.add_header("Authorization", f"Bearer {cfg_secret}")
         resp_r = urllib.request.urlopen(req_r, timeout=15)
         script_data = json.loads(resp_r.read().decode())
         script_code = script_data["content"]
         script_lines = script_data["lines"]
     except Exception as e:
-        log.error(f"proposition: lecture script: {e}")
+        log.error(f"proposition: lecture script {target_file}: {e}")
         return "FAIL"
 
     # 2. Contexte pertinent (lignes autour du pattern d'erreur)
@@ -3652,6 +3662,7 @@ def _proposer_guerison(signature, message_erreur, nb_occurrences=2):
     cout_eur = (tok_in / 1_000_000) * 3 + (tok_out / 1_000_000) * 15
     pending = {
         "signature": signature[:80],
+        "target": target_file,
         "old_str": old_str,
         "new_str": new_str,
         "explication": explication,
@@ -3672,6 +3683,7 @@ def _proposer_guerison(signature, message_erreur, nb_occurrences=2):
     texte_msg = (
         f"🔧 *PATCH PROPOSÉ — auto-diagnostic*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
+        f"📄 Fichier : {target_file}\n"
         f"⚠️ Erreur récurrente ({nb_occurrences}x) :\n"
         f"`{msg_clean[:200]}`\n\n"
         f"🩹 Correction proposée :\n{explication[:300]}\n\n"

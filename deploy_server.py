@@ -176,6 +176,34 @@ def _security_checks(code):
             return f"Code dangereux: {f[:30]}"
     return None
 
+
+# Patch 13/06/2026 : patch multi-fichiers (assistant.py / skills.py / shared.py)
+# Chaque fichier a ses propres "elements requis" pour valider qu'il n'est pas casse.
+PATCH_TARGETS = {
+    "assistant.py": "/home/lolufe/assistant/assistant.py",
+    "skills.py": "/home/lolufe/assistant/skills.py",
+    "shared.py": "/home/lolufe/assistant/shared.py",
+}
+
+_REQUIRED_BY_FILE = {
+    "assistant.py": ["def main():", "def traiter_message(", "CFG = load_config()"],
+    "skills.py": ["def traiter_callback(", "def cmd_zigbee(", "from shared import"],
+    "shared.py": ["def telegram_send(", "def mem_get(", "def init_db(", "def load_config("],
+}
+
+
+def _security_checks_for(code, target):
+    """Verifie les elements requis specifiques au fichier cible + interdits globaux."""
+    required = _REQUIRED_BY_FILE.get(target, [])
+    for r in required:
+        if r.lower() not in code.lower():
+            return f"Elément requis manquant ({target}): {r}"
+    forbidden = ["os.system('rm -rf", "shutil.rmtree('/'", "subprocess.run(['rm'"]
+    for f in forbidden:
+        if f in code:
+            return f"Code dangereux: {f[:30]}"
+    return None
+
 # === ACTIONS ===
 
 def action_read(filepath=None):
@@ -311,10 +339,15 @@ def action_list_files(subdir=""):
 
 def action_patch(data):
     mode = data.get("mode", "full")
-    backup_name = f"assistant_pre_deploy_{datetime.now().strftime('%Y%m%d_%H%M%S')}.py"
+    # Patch 13/06/2026 : cible multi-fichiers. Defaut = assistant.py (retrocompat).
+    target = data.get("target", "assistant.py")
+    if target not in PATCH_TARGETS:
+        return {"status": "error", "message": f"Cible inconnue: {target} (autorise: {list(PATCH_TARGETS)})"}
+    target_path = PATCH_TARGETS[target]
+    backup_name = f"{target}.pre_patch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.bak"
     backup_path = os.path.join(VERSIONS_DIR, backup_name)
     try:
-        shutil.copy2(SCRIPT_PATH, backup_path)
+        shutil.copy2(target_path, backup_path)
     except Exception as e:
         return {"status": "error", "message": f"Backup impossible: {e}"}
 
@@ -340,23 +373,29 @@ def action_patch(data):
         if not old_str:
             return {"status": "error", "message": "old_str vide"}
         try:
-            with open(SCRIPT_PATH, "r") as f:
+            with open(target_path, "r") as f:
                 code = f.read()
             count = code.count(old_str)
             if count == 0:
-                return {"status": "error", "message": "old_str non trouvé dans le script"}
+                return {"status": "error", "message": f"old_str non trouvé dans {target}"}
             if count > 1:
-                return {"status": "error", "message": f"old_str trouvé {count} fois — ambigu"}
+                return {"status": "error", "message": f"old_str trouvé {count} fois dans {target} — ambigu"}
             code = code.replace(old_str, new_str)
-            checks = _security_checks(code)
+            checks = _security_checks_for(code, target)
             if checks:
                 return {"status": "error", "message": f"Sécurité post-patch: {checks}"}
-            with open(SCRIPT_PATH, "w") as f:
+            # Verif syntaxe Python avant ecriture
+            import ast as _ast
+            try:
+                _ast.parse(code)
+            except SyntaxError as se:
+                return {"status": "error", "message": f"Syntaxe invalide post-patch: {se}"}
+            with open(target_path, "w") as f:
                 f.write(code)
-            return {"status": "ok", "mode": "replace", "backup": backup_name,
+            return {"status": "ok", "mode": "replace", "target": target, "backup": backup_name,
                     "timestamp": datetime.now().isoformat()}
         except Exception as e:
-            shutil.copy2(backup_path, SCRIPT_PATH)
+            shutil.copy2(backup_path, target_path)
             return {"status": "error", "message": f"Rollback: {e}"}
     return {"status": "error", "message": f"Mode inconnu: {mode}"}
 
