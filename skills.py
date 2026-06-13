@@ -1487,6 +1487,7 @@ def traiter_callback(callback_query):
 
         # Appliquer via deploy_server /patch (backup auto inclus)
         try:
+            import urllib.request  # import local : garantit la visibilité dans ce scope
             cfg_secret = CFG.get("deploy_secret", "")
             payload = json.dumps({"mode": "replace", "old_str": old_str, "new_str": new_str}).encode()
             sig = hmac.new(cfg_secret.encode(), payload, hashlib.sha256).hexdigest()
@@ -1520,6 +1521,7 @@ def traiter_callback(callback_query):
 
         # Restart
         try:
+            import urllib.request  # import local
             payload_r = json.dumps({"action": "restart"}).encode()
             sig_r = hmac.new(cfg_secret.encode(), payload_r, hashlib.sha256).hexdigest()
             req_restart = urllib.request.Request("http://localhost:8501/restart", data=payload_r, method="POST")
@@ -3563,6 +3565,7 @@ def _proposer_guerison(signature, message_erreur, nb_occurrences=2):
 
     # 1. Lire le script assistant.py via deploy_server local
     try:
+        import urllib.request  # import local : visibilité garantie dans ce scope
         cfg_secret = CFG.get("deploy_secret", "")
         req_r = urllib.request.Request("http://localhost:8501/read")
         req_r.add_header("Authorization", f"Bearer {cfg_secret}")
