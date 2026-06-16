@@ -3269,3 +3269,14 @@ def veille_integrite_au_demarrage():
     else:
         log.info('🛡️ Veille integrite : RAS')
     return rapport
+
+
+# === Sonnette Video : push FCM (isole, ne bloque jamais l'agent) ===
+try:
+    import sonnette_video as _sonnette_video
+    _sonnette_video.start()
+except Exception as _sv_e:
+    try:
+        log.warning(f"Sonnette Video init KO: {_sv_e}")
+    except Exception:
+        pass
