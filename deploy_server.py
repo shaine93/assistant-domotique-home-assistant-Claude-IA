@@ -1232,9 +1232,9 @@ def action_restart_self():
 
 def action_restart():
     try:
-        subprocess.run(["sudo", "systemctl", "restart", "assistant"], capture_output=True, text=True, timeout=30)
+        subprocess.run(["sudo", "-n", "systemctl", "restart", "assistant.service"], capture_output=True, text=True, timeout=30)
         time.sleep(2)
-        status = subprocess.run(["sudo", "systemctl", "is-active", "assistant"], capture_output=True, text=True, timeout=10)
+        status = subprocess.run(["systemctl", "is-active", "assistant.service"], capture_output=True, text=True, timeout=10)
         is_active = status.stdout.strip() == "active"
         if is_active:
             log_deploy("✅ assistant.service redémarré")
