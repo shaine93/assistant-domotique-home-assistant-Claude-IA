@@ -76,8 +76,19 @@ def _save_registry(reg):
         log.warning("Sonnette Video: sauvegarde registre KO: %s", str(e)[:100])
 
 
+MAX_PHONES = 10
+MAX_LABEL = 40
+MAX_TOKEN = 4096
+
+
+def _clean_label(s):
+    s = "".join(ch for ch in (s or "") if ch.isprintable() and ch not in "\n\r\t")
+    return s.strip()[:MAX_LABEL] or "telephone"
+
+
 def _register_raw(raw):
-    """raw = 'label|token' ou 'token' (retrocompat). Ajoute/maj dans le registre."""
+    """raw = 'label|token' ou 'token' (retrocompat). Ajoute/maj dans le registre.
+    Securise : label nettoye+borne, token borne, registre plafonne (anti-abus)."""
     if not raw or raw in ("unknown", "unavailable"):
         return
     raw = raw.strip()
@@ -85,13 +96,18 @@ def _register_raw(raw):
         label, token = raw.split("|", 1)
     else:
         label, token = "telephone", raw
-    label, token = label.strip(), token.strip()
-    if len(token) < 20:
+    label = _clean_label(label)
+    token = token.strip()
+    if not (20 <= len(token) <= MAX_TOKEN):
         return
     with _reg_lock:
         reg = _load_registry()
+        if token not in reg and len(reg) >= MAX_PHONES:
+            log.warning("Sonnette Video: registre plein (%d) - enregistrement ignore (%s)",
+                        MAX_PHONES, label)
+            return
         existed = token in reg
-        reg[token] = {"label": label or "telephone",
+        reg[token] = {"label": label,
                       "added": reg.get(token, {}).get("added", datetime.now().isoformat()),
                       "last_seen": datetime.now().isoformat()}
         _save_registry(reg)
@@ -200,7 +216,10 @@ def _on_ring():
 
     reg = _load_registry()
     if not reg:
-        log.warning("Sonnette Video: APPUI mais aucun telephone enregistre - push ignore"); return
+        log.warning("Sonnette Video: APPUI mais aucun telephone enregistre - push ignore")
+        _alert("\U0001F6A8 SONNETTE : quelqu'un a sonne mais AUCUN telephone n'est enregistre. "
+               "Rouvre l'app Sonnette Video sur le telephone pour la reactiver.")
+        return
 
     image_url = ""
     try:
@@ -235,7 +254,58 @@ def _on_ring():
                "(token expire). Rouvre l'app Sonnette Video dessus pour le reactiver." % labels)
         log.warning("Sonnette Video: %d token(s) mort(s) purge(s): %s", len(dead), labels)
 
+    if ok == 0:
+        _alert("\U0001F6A8 SONNETTE : quelqu'un a sonne mais le push n'a atteint AUCUN "
+               "telephone (%d enregistre(s)). Verifie l'app et la connexion du telephone." % len(reg))
     log.info("Sonnette Video: APPUI -> push envoye a %d/%d telephone(s)", ok, len(reg))
+
+
+# ---------- Surveillance proactive (liveness quotidien) ----------
+
+def _validate_token(token):
+    """Test FCM 'validate_only' : verifie la validite du token SANS notifier."""
+    access = _get_access_token()
+    payload = {"validate_only": True,
+               "message": {"token": token, "data": {"type": "ping"}}}
+    r = _http().post(
+        "https://fcm.googleapis.com/v1/projects/%s/messages:send" % PROJECT_ID,
+        headers={"Authorization": "Bearer " + access, "Content-Type": "application/json"},
+        data=json.dumps(payload), timeout=15)
+    return r.status_code, r.text
+
+
+def _liveness_loop():
+    """Une fois par jour : verifie que chaque telephone est toujours joignable et
+    ALERTE Telegram si un token est mort ou si le registre est vide. Ne purge PAS
+    (pour ne jamais retirer par erreur le telephone de Michele) : la purge reelle
+    reste reactive, au moment d'une vraie sonnerie."""
+    time.sleep(180)
+    while True:
+        try:
+            reg = _load_registry()
+            if not reg:
+                _alert("\u26A0\uFE0F Sonnette : AUCUN telephone enregistre. La sonnette ne "
+                       "previendra personne. Rouvre l'app Sonnette Video sur le telephone.")
+            else:
+                dead = []
+                for token, meta in list(reg.items()):
+                    try:
+                        code, body = _validate_token(token)
+                        if _is_dead_token(code, body):
+                            dead.append(meta.get("label", "telephone"))
+                    except Exception:
+                        pass  # erreur reseau ponctuelle : on n'alerte pas a tort
+                if dead:
+                    labels = ", ".join(sorted(set(dead)))
+                    _alert("\u26A0\uFE0F Sonnette : le(s) telephone(s) [%s] ne semblent plus "
+                           "joignables (token expire). Rouvre l'app Sonnette Video dessus pour "
+                           "garantir la sonnerie." % labels)
+                    log.warning("Sonnette Video: liveness - token(s) suspect(s): %s", labels)
+                else:
+                    log.info("Sonnette Video: liveness OK - %d telephone(s) joignable(s)", len(reg))
+        except Exception as e:
+            log.warning("Sonnette Video: liveness KO: %s", str(e)[:120])
+        time.sleep(24 * 3600)
 
 
 # ---------- Temps reel : WebSocket ----------
@@ -352,4 +422,5 @@ def start():
         return
     _started = True
     threading.Thread(target=_run, name="sonnette_video", daemon=True).start()
-    log.info("Sonnette Video: thread demarre")
+    threading.Thread(target=_liveness_loop, name="sonnette_liveness", daemon=True).start()
+    log.info("Sonnette Video: thread demarre (+ surveillance proactive)")
