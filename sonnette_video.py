@@ -15,7 +15,7 @@ import json
 import time
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 
 log = logging.getLogger("sonnette_video")
 
@@ -170,6 +170,28 @@ def _alert(text):
         log.warning("Sonnette Video: alerte Telegram KO: %s", str(e)[:100])
 
 
+def _is_recent(s, max_age=90):
+    """Vrai si l'horodatage ISO est dans les max_age dernieres secondes."""
+    try:
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - dt).total_seconds()
+        return -15 <= age <= max_age
+    except Exception:
+        return False
+
+
+def _real_press(from_s, to_s):
+    """Vrai appui = transition depuis un etat VALIDE vers un horodatage RECENT et different.
+    Bloque les fausses sonneries au redemarrage de HA (restauration depuis 'unavailable')."""
+    if from_s in (None, "", "unknown", "unavailable"):
+        return False
+    if not to_s or to_s in ("unknown", "unavailable") or to_s == from_s:
+        return False
+    return _is_recent(to_s)
+
+
 def _on_ring():
     try:
         ha_url, ha_tok = _load_ha()
@@ -257,12 +279,16 @@ def _ws_loop():
                 if msg.get("type") != "event":
                     continue
                 tr = msg.get("event", {}).get("variables", {}).get("trigger", {})
-                st = (tr.get("to_state") or {}).get("state")
+                to_s = (tr.get("to_state") or {}).get("state")
+                from_s = (tr.get("from_state") or {}).get("state")
                 if msg.get("id") == 1:
-                    if st and st not in ("unknown", "unavailable"):
+                    if _real_press(from_s, to_s):
                         _on_ring()
+                    else:
+                        log.info("Sonnette Video: changement ignore (pas un vrai appui: %s -> %s)",
+                                 from_s, str(to_s)[:25])
                 elif msg.get("id") == 2:
-                    _register_raw(st)
+                    _register_raw(to_s)
         except Exception as e:
             log.warning("Sonnette Video: WS interrompu (%s) - reconnexion dans %ss", str(e)[:90], backoff)
         finally:
@@ -290,7 +316,8 @@ def _poll_loop():
                     last_ring = ev
                 elif ev != last_ring:
                     last_ring = ev
-                    _on_ring()
+                    if _is_recent(ev):
+                        _on_ring()
             tok = (_ha_state(ha_url, ha_tok, TOKEN_ENTITY).get("state") or "").strip()
             if tok and tok != last_tok:
                 last_tok = tok
