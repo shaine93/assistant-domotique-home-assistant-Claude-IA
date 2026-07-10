@@ -247,3 +247,18 @@ z2m_devs = [d for d in devs if any(t and t[0]=='mqtt' for t in d.get('identifier
 1. Reproduire en isolation (`/tmp/d.py`) avant de patcher
 2. Web search release notes / forums pour breaking changes
 3. Préférer source de vérité (device_registry) aux attributs volatils
+
+
+## 🎤 Transcription vocale Telegram — opérationnelle (10/07/2026)
+
+Philippe peut parler au bot en note vocale : il transcrit et traite la demande, répond en texte.
+
+**Pipeline** (transcrire_vocal dans shared.py L3161) :
+Note vocale Telegram (.ogg) → getFile/download → ffmpeg (.ogg → FLAC 16kHz mono)
+→ Google Speech API (fr-FR) → texte → traité comme un message normal.
+
+**Vérifié le 10/07/2026** : ffmpeg présent (/usr/bin/ffmpeg), handler branché
+(assistant.py L859), API Google Speech répond (HTTP 200). Testé en réel : OK.
+
+La fonction existait depuis le début mais n'avait jamais servi (0 transcription
+dans les logs avant cette date). Aucun code à ajouter — juste à l'utiliser.
