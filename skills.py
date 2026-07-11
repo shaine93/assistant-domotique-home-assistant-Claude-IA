@@ -12909,22 +12909,67 @@ def _traiter_message_impl(texte):
                 return f"❌ Machine '{nom_machine}' non trouvée.\nTapez /appareils pour voir la liste."
         return "❌ Aucun programme enregistré."
 
-    # Gestion liste expéditeurs importants (12/07/2026)
-    if t.startswith("mails ajouter ") or t.startswith("mail ajouter "):
-        import json as _json
-        adresse = texte.split("ajouter", 1)[1].strip()
+    # Gestion liste expéditeurs importants (12/07/2026, tolérant vocal)
+    # Détecte l'intention même avec fautes de transcription et ordre libre.
+    _mots = t.split()
+    _parle_mail = any(m.startswith("mail") or m.startswith("courrier") or m.startswith("expedit")
+                      or m.startswith("expédit") for m in _mots)
+    _action_ajout = any(m in ("ajoute", "ajouter", "joute", "rajoute", "rajouter",
+                              "ajout", "add", "marque") for m in _mots)
+    _action_retrait = any(m in ("retire", "retirer", "supprime", "supprimer", "enleve",
+                                "enlève", "enlever", "vire", "retrait") for m in _mots)
+
+    if _parle_mail and _action_ajout:
+        import json as _json, re as _re
+        # Extraire ce qui ressemble à une adresse/domaine, sinon les mots après l'action
+        adresse = ""
+        # 1. chercher un motif adresse ou domaine (mot avec un point)
+        m = _re.search(r"[\w.+-]+@[\w.-]+|\b[\w-]+\.[a-z]{2,}\b", texte, _re.IGNORECASE)
+        if m:
+            adresse = m.group(0)
+        else:
+            # 2. sinon, prendre les mots après le mot d'action, en retirant le mot "mail"
+            mots_src = texte.split()
+            garde = []
+            skip_words = {"mail","mails","courrier","aux","au","à","a","dans","les","la","le",
+                          "important","importants","importante","importantes","expediteur",
+                          "expéditeur","expediteurs","expéditeurs","de","liste"}
+            action_seen = False
+            for w in mots_src:
+                wl = w.lower().strip(".,;:")
+                if wl in ("ajoute","ajouter","joute","rajoute","rajouter","ajout","add","marque"):
+                    action_seen = True
+                    continue
+                if action_seen and wl not in skip_words:
+                    garde.append(w)
+            adresse = " ".join(garde).strip()
         if adresse:
             liste = _json.loads(mem_get("expediteurs_importants") or "[]")
             if adresse.lower() not in [x.lower() for x in liste]:
                 liste.append(adresse)
                 mem_set("expediteurs_importants", _json.dumps(liste))
-                return f"⭐ Ajouté aux expéditeurs importants : {adresse}\n({len(liste)} au total)"
+                return f"⭐ Ajouté aux expéditeurs importants : {adresse}\n({len(liste)} au total)\n\nDis « mes mails » pour voir le tri."
             return f"Déjà dans la liste : {adresse}"
-        return "Précise l'adresse : mails ajouter banque@exemple.fr"
+        return "Je n'ai pas saisi l'expéditeur. Exemple : « mail ajoute banquepopulaire.fr »"
 
-    if t.startswith("mails retirer ") or t.startswith("mails supprimer ") or t.startswith("mails enlever "):
-        import json as _json
-        adresse = texte.split(" ", 2)[2].strip() if len(texte.split(" ")) > 2 else ""
+    if _parle_mail and _action_retrait:
+        import json as _json, re as _re
+        m = _re.search(r"[\w.+-]+@[\w.-]+|\b[\w-]+\.[a-z]{2,}\b", texte, _re.IGNORECASE)
+        adresse = m.group(0) if m else ""
+        if not adresse:
+            mots_src = texte.split()
+            skip_words = {"mail","mails","courrier","aux","au","à","a","dans","les","la","le",
+                          "important","importants","de","liste","expediteur","expéditeur"}
+            garde = []
+            action_seen = False
+            for w in mots_src:
+                wl = w.lower().strip(".,;:")
+                if wl in ("retire","retirer","supprime","supprimer","enleve","enlève","enlever","vire","retrait"):
+                    action_seen = True
+                    continue
+                if action_seen and wl not in skip_words:
+                    garde.append(w)
+            adresse = " ".join(garde).strip()
         liste = _json.loads(mem_get("expediteurs_importants") or "[]")
         avant = len(liste)
         liste = [x for x in liste if adresse.lower() not in x.lower()]
