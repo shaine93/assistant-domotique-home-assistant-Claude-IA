@@ -9020,6 +9020,84 @@ def cmd_batteries():
     return rapport if len(batteries) > 0 else "🔋 Aucune batterie détectée"
 
 
+def cmd_mails():
+    """Lit les mails non lus des 3 derniers jours via IMAP et les trie avec Claude.
+    Ne remonte que les IMPORTANTS (banque, employeur, admin, factures, RDV, juridique).
+    Ajoute 12/07/2026 — commande vocale/texte 'mails' / 'mes mails'."""
+    import imaplib, email
+    from email.header import decode_header
+
+    def _decode(s):
+        if not s:
+            return ""
+        out = ""
+        for txt, enc in decode_header(s):
+            if isinstance(txt, bytes):
+                try:
+                    out += txt.decode(enc or "utf-8", errors="replace")
+                except Exception:
+                    out += txt.decode("utf-8", errors="replace")
+            else:
+                out += txt
+        return out
+
+    user = CFG.get("imap_user", "")
+    pwd = CFG.get("imap_pass", "")
+    if not user or not pwd:
+        return "❌ Mails non configurés (imap_user/imap_pass manquants dans config.json)."
+
+    # 1. Connexion + récupération non lus 3 derniers jours
+    try:
+        m = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+        m.login(user, pwd)
+        m.select("INBOX")
+        date_limite = (datetime.now() - timedelta(days=3)).strftime("%d-%b-%Y")
+        typ, data = m.search(None, f"(UNSEEN SINCE {date_limite})")
+        ids = data[0].split() if data[0] else []
+        mails = []
+        for mid in ids[-20:]:  # plafond 20 pour le budget tokens
+            typ, msgdata = m.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+            msg = email.message_from_bytes(msgdata[0][1])
+            mails.append({
+                "from": _decode(msg.get("From", "")),
+                "subject": _decode(msg.get("Subject", "")),
+            })
+        m.logout()
+    except Exception as e:
+        log.error(f"cmd_mails IMAP: {e}")
+        return f"❌ Connexion Gmail échouée : {type(e).__name__}"
+
+    if not mails:
+        return "📭 Aucun mail non lu ces 3 derniers jours."
+
+    # 2. Tri par Claude (Haiku = économe, tâche simple)
+    liste = "\n".join(f"{i+1}. De: {e['from']} | Sujet: {e['subject']}" for i, e in enumerate(mails))
+    try:
+        client = anthropic.Anthropic(api_key=CFG["anthropic_api_key"])
+        r = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=900,
+            system=("Tu tries des mails non lus. Classe chaque mail IMPORTANT ou BRUIT.\n"
+                    "IMPORTANT = banque, employeur, administratif, impôts, factures, "
+                    "RDV médicaux, livraisons attendues, messages personnels, juridique/avocat, "
+                    "sécurité de compte.\n"
+                    "BRUIT = promotions, publicités, newsletters, réseaux sociaux, "
+                    "notifications automatiques, confirmations de commande, offres d'emploi non sollicitées.\n\n"
+                    "Réponds UNIQUEMENT avec les IMPORTANTS, un par ligne, format :\n"
+                    "• [expéditeur court] — [sujet court] — [pourquoi, 4 mots max]\n\n"
+                    "Si aucun important : réponds exactement 'Rien d''important.'"),
+            messages=[{"role": "user", "content": f"Mails non lus :\n{liste}"}]
+        )
+        tri = r.content[0].text.strip()
+        log_token_usage(r.usage.input_tokens, r.usage.output_tokens)
+    except Exception as e:
+        log.error(f"cmd_mails tri: {e}")
+        return f"❌ Tri Claude échoué : {type(e).__name__}"
+
+    entete = f"📬 {len(mails)} mail(s) non lu(s) sur 3 jours\n━━━━━━━━━━━━━━━━━━\n"
+    return entete + tri
+
+
 def cmd_zigbee():
     etats = ha_get("states")
     if not etats:
@@ -12800,6 +12878,12 @@ def _traiter_message_impl(texte):
             if not found:
                 return f"❌ Machine '{nom_machine}' non trouvée.\nTapez /appareils pour voir la liste."
         return "❌ Aucun programme enregistré."
+
+    # Commande mails : lecture Gmail + tri Claude (12/07/2026)
+    if t in ("mails", "mail", "mes mails", "courrier", "mails importants",
+             "mes mails importants", "regarde mes mails", "regarde mes mails importants",
+             "verifie mes mails", "vérifie mes mails"):
+        return cmd_mails()
 
     if t.startswith("energie ") or t.startswith("énergie "):
         arg = t.split(" ", 1)[1].strip()
