@@ -654,7 +654,9 @@ def main():
     bilan = validation_demarrage()
 
     # ═══ SÉCURITÉ CANAL ═══
-    # Dernier code < 24h → auto-déverrouillé. Sinon → SMS.
+    # Dernière activité < 7 jours → auto-déverrouillé. Sinon → SMS.
+    # Patch 12/07/2026 : fenêtre portée à 7j + refresh à chaque message
+    # (voir plus bas) pour ne plus redemander de SMS tant que Philippe utilise le bot.
     dernier_code = mem_get("dernier_deverrouillage")
     skip_sms = False
     if MODE == "DEV":
@@ -663,7 +665,7 @@ def main():
     if dernier_code:
         try:
             dt = datetime.strptime(dernier_code[:19], "%Y-%m-%dT%H:%M:%S")
-            if (datetime.now() - dt).total_seconds() < 86400:
+            if (datetime.now() - dt).total_seconds() < 7 * 86400:
                 skip_sms = True
                 shared.canal_verrouille = False
         except Exception:
@@ -893,6 +895,13 @@ def main():
                     else:
                         telegram_send("🔐 Entrez le code SMS (ou tapez /sms pour en recevoir un nouveau)")
                     continue
+
+                # Refresh sécurité canal : tant que Philippe écrit, le canal reste ouvert
+                # (repousse l'échéance de 7j à chaque message). Patch 12/07/2026.
+                try:
+                    mem_set("dernier_deverrouillage", datetime.now().isoformat())
+                except Exception:
+                    pass
 
                 reponse = traiter_message(texte)
                 # L'utilisateur demande → la réponse passe TOUJOURS (force=True)

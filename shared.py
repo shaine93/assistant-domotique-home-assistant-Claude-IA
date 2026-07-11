@@ -871,12 +871,12 @@ def init_db():
         dernier = mem_get("dernier_deverrouillage")
         if dernier:
             delta = (datetime.now() - datetime.fromisoformat(dernier)).total_seconds()
-            if delta < 24 * 3600:
+            if delta < 7 * 24 * 3600:
                 canal_verrouille = False
-                heures = delta / 3600
-                log.info(f"🔓 Canal auto-déverrouillé (dernier déverrouillage il y a {heures:.1f}h < 24h)")
+                jours = delta / 86400
+                log.info(f"🔓 Canal auto-déverrouillé (dernière activité il y a {jours:.1f}j < 7j)")
             else:
-                log.info(f"🔒 Canal verrouillé (dernier déverrouillage il y a {delta/3600:.1f}h > 24h)")
+                log.info(f"🔒 Canal verrouillé (dernière activité il y a {delta/86400:.1f}j > 7j)")
     except Exception as e_unlock:
         log.error(f"Auto-déverrouillage: {e_unlock}")
 
