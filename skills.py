@@ -9070,32 +9070,62 @@ def cmd_mails():
     if not mails:
         return "📭 Aucun mail non lu ces 3 derniers jours."
 
-    # 2. Tri par Claude (Haiku = économe, tâche simple)
-    liste = "\n".join(f"{i+1}. De: {e['from']} | Sujet: {e['subject']}" for i, e in enumerate(mails))
+    # Expéditeurs marqués importants par Philippe (liste gérée via /mails ajouter ...)
+    import json as _json
     try:
-        client = anthropic.Anthropic(api_key=CFG["anthropic_api_key"])
-        r = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=900,
-            system=("Tu tries des mails non lus. Classe chaque mail IMPORTANT ou BRUIT.\n"
-                    "IMPORTANT = banque, employeur, administratif, impôts, factures, "
-                    "RDV médicaux, livraisons attendues, messages personnels, juridique/avocat, "
-                    "sécurité de compte.\n"
-                    "BRUIT = promotions, publicités, newsletters, réseaux sociaux, "
-                    "notifications automatiques, confirmations de commande, offres d'emploi non sollicitées.\n\n"
-                    "Réponds UNIQUEMENT avec les IMPORTANTS, un par ligne, format :\n"
-                    "• [expéditeur court] — [sujet court] — [pourquoi, 4 mots max]\n\n"
-                    "Si aucun important : réponds exactement 'Rien d''important.'"),
-            messages=[{"role": "user", "content": f"Mails non lus :\n{liste}"}]
-        )
-        tri = r.content[0].text.strip()
-        log_token_usage(r.usage.input_tokens, r.usage.output_tokens)
-    except Exception as e:
-        log.error(f"cmd_mails tri: {e}")
-        return f"❌ Tri Claude échoué : {type(e).__name__}"
+        exp_imp = _json.loads(mem_get("expediteurs_importants") or "[]")
+    except Exception:
+        exp_imp = []
+    # Marquer d'office les mails venant d'un expéditeur important
+    for e in mails:
+        frm = e["from"].lower()
+        e["prioritaire"] = any(x.lower() in frm for x in exp_imp)
+
+    # Séparer : prioritaires (expéditeurs définis) vs à trier par Claude
+    prioritaires = [e for e in mails if e.get("prioritaire")]
+    a_trier = [e for e in mails if not e.get("prioritaire")]
+
+    # 2. Tri par Claude : classe les mails restants (skip si tout est déjà prioritaire)
+    liste = "\n".join(f"{i+1}. De: {e['from']} | Sujet: {e['subject']}" for i, e in enumerate(a_trier))
+    tri = ""
+    if not a_trier:
+        tri = "⚪ AUTRES\naucun"
+    else:
+        try:
+            client = anthropic.Anthropic(api_key=CFG["anthropic_api_key"])
+            r = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=1200,
+                system=("Tu tries des mails non lus et tu les présentes TOUS, classés.\n\n"
+                        "IMPORTANT = banque, employeur, administratif, impôts, factures, "
+                        "RDV médicaux, livraisons attendues, messages personnels, juridique/avocat, "
+                        "sécurité de compte.\n"
+                        "SECONDAIRE = promotions, publicités, newsletters, réseaux sociaux, "
+                        "notifications automatiques, confirmations de commande, offres d'emploi.\n\n"
+                        "Format de réponse EXACT :\n"
+                        "🔴 IMPORTANTS\n"
+                        "• [expéditeur] — [sujet court] — [pourquoi en 4 mots]\n"
+                        "(si aucun, écris : aucun)\n\n"
+                        "⚪ SECONDAIRES\n"
+                        "• [expéditeur] — [sujet court] — [catégorie: pub/réseau/notif/emploi...]\n\n"
+                        "Sois concis. Montre TOUS les mails, aucun ne doit disparaître."),
+                messages=[{"role": "user", "content": f"Mails non lus ({len(mails)}) :\n{liste}"}]
+            )
+            tri = r.content[0].text.strip()
+            log_token_usage(r.usage.input_tokens, r.usage.output_tokens)
+        except Exception as e:
+            log.error(f"cmd_mails tri: {e}")
+            tri = "(tri IA indisponible)\n" + "\n".join(f"• {e['from'][:30]} — {e['subject'][:45]}" for e in a_trier)
 
     entete = f"📬 {len(mails)} mail(s) non lu(s) sur 3 jours\n━━━━━━━━━━━━━━━━━━\n"
-    return entete + tri
+    # Bloc prioritaires (expéditeurs définis par Philippe) en tête
+    bloc_prio = ""
+    if prioritaires:
+        bloc_prio = "⭐ EXPÉDITEURS IMPORTANTS\n"
+        for e in prioritaires:
+            bloc_prio += f"• {e['from'][:35]} — {e['subject'][:45]}\n"
+        bloc_prio += "\n"
+    return entete + bloc_prio + tri
 
 
 def cmd_zigbee():
@@ -12878,6 +12908,39 @@ def _traiter_message_impl(texte):
             if not found:
                 return f"❌ Machine '{nom_machine}' non trouvée.\nTapez /appareils pour voir la liste."
         return "❌ Aucun programme enregistré."
+
+    # Gestion liste expéditeurs importants (12/07/2026)
+    if t.startswith("mails ajouter ") or t.startswith("mail ajouter "):
+        import json as _json
+        adresse = texte.split("ajouter", 1)[1].strip()
+        if adresse:
+            liste = _json.loads(mem_get("expediteurs_importants") or "[]")
+            if adresse.lower() not in [x.lower() for x in liste]:
+                liste.append(adresse)
+                mem_set("expediteurs_importants", _json.dumps(liste))
+                return f"⭐ Ajouté aux expéditeurs importants : {adresse}\n({len(liste)} au total)"
+            return f"Déjà dans la liste : {adresse}"
+        return "Précise l'adresse : mails ajouter banque@exemple.fr"
+
+    if t.startswith("mails retirer ") or t.startswith("mails supprimer ") or t.startswith("mails enlever "):
+        import json as _json
+        adresse = texte.split(" ", 2)[2].strip() if len(texte.split(" ")) > 2 else ""
+        liste = _json.loads(mem_get("expediteurs_importants") or "[]")
+        avant = len(liste)
+        liste = [x for x in liste if adresse.lower() not in x.lower()]
+        mem_set("expediteurs_importants", _json.dumps(liste))
+        if len(liste) < avant:
+            return f"🗑️ Retiré : {adresse}\n({len(liste)} restants)"
+        return f"Non trouvé dans la liste : {adresse}"
+
+    if t in ("mails liste", "liste mails", "mes expediteurs", "expediteurs importants",
+             "mails expediteurs", "liste expediteurs"):
+        import json as _json
+        liste = _json.loads(mem_get("expediteurs_importants") or "[]")
+        if not liste:
+            return ("📭 Aucun expéditeur important défini.\n\n"
+                    "Ajoute-en un : « mails ajouter banque@exemple.fr »")
+        return "⭐ EXPÉDITEURS IMPORTANTS\n" + "\n".join(f"• {x}" for x in liste)
 
     # Commande mails : lecture Gmail + tri Claude (12/07/2026)
     # Match souple : toute phrase parlant de mail/courrier déclenche la lecture.
