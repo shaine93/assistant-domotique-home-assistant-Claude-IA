@@ -12880,9 +12880,11 @@ def _traiter_message_impl(texte):
         return "❌ Aucun programme enregistré."
 
     # Commande mails : lecture Gmail + tri Claude (12/07/2026)
-    if t in ("mails", "mail", "mes mails", "courrier", "mails importants",
-             "mes mails importants", "regarde mes mails", "regarde mes mails importants",
-             "verifie mes mails", "vérifie mes mails"):
+    # Match souple : toute phrase parlant de mail/courrier déclenche la lecture.
+    # Exclut les cas d'envoi ("envoie un mail", "écris un mail") gérés ailleurs.
+    _mots_mail = ("mail" in t or "courrier" in t or "e-mail" in t or "email" in t)
+    _est_envoi = any(v in t for v in ("envoie", "envoi", "écris", "ecris", "rédige", "redige", "compose"))
+    if _mots_mail and not _est_envoi:
         return cmd_mails()
 
     if t.startswith("energie ") or t.startswith("énergie "):
