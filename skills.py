@@ -12082,6 +12082,19 @@ def _heartbeat_observe(index, now):
             # Mode alerts : envoyer Telegram si guard inactif et cooldown OK
             if guard_active:
                 log.debug(f"💓 heartbeat_v2 : {entity_id} gap {gap_min}min étouffé (guard={guard_name})")
+                # Patch 11/08/2026 : tracer les etouffements en mode alerts.
+                # Sans cela un gap bloque par le guard ne laisse aucune trace SQL,
+                # et il est impossible de savoir si le guard est trop large.
+                try:
+                    conn_g = sqlite3.connect(DB_PATH)
+                    conn_g.execute(
+                        "INSERT INTO heartbeat_v2_dryrun (ts_iso, entity_id, gap_min, guard_active, would_alert) VALUES (?, ?, ?, ?, ?)",
+                        (now.isoformat(), entity_id, gap_min, 1, 0)
+                    )
+                    conn_g.commit()
+                    conn_g.close()
+                except Exception as ex_g:
+                    log.debug(f"heartbeat_v2 trace guard: {ex_g}")
                 continue
 
             # Vérifier cooldown 24h
@@ -12137,6 +12150,89 @@ def _heartbeat_observe(index, now):
 
     except Exception as e:
         log.debug(f"heartbeat_observe: {e}")
+
+
+def cmd_heartbeat_v2():
+    """Statut REEL du skill heartbeat v2 (lit heartbeat_v2, pas sensor_heartbeat)."""
+    from datetime import datetime, timezone
+    try:
+        _init_heartbeat_v2_table()
+        mode = _heartbeat_v2_mode()
+        lignes = ["HEARTBEAT V2", "=" * 24, "", "Mode : " + str(mode)]
+        if mode == "log_only":
+            try:
+                act = datetime.fromisoformat(_heartbeat_v2_activation_date())
+                if act.tzinfo is None:
+                    act = act.replace(tzinfo=timezone.utc)
+                j = (datetime.now(timezone.utc) - act).total_seconds() / 86400
+                lignes.append("Observation : J%.1f/J7 avant bascule auto" % j)
+            except Exception:
+                pass
+        lignes.append("")
+        gaps = {}
+        index = {}
+        try:
+            etats = ha_get("states") or []
+            index = {e["entity_id"]: e for e in etats}
+            now_utc = datetime.now(timezone.utc)
+            for k, v in index.items():
+                upd = v.get("last_updated", "")
+                if not upd:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(upd.replace("Z", "+00:00"))
+                    gaps[k] = int((now_utc - dt).total_seconds() / 60)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        conn = sqlite3.connect(DB_PATH)
+        for c in _HEARTBEAT_V2_SENSORS:
+            eid = c["entity_id"]
+            seuil = c["max_gap_min"]
+            gap = gaps.get(eid)
+            row = conn.execute(
+                "SELECT last_alert_iso, total_alerts, total_dryrun FROM heartbeat_v2 WHERE entity_id = ?",
+                (eid,)).fetchone()
+            la, na, nd = row if row else (None, 0, 0)
+            if gap is None:
+                ic, txt = "[?]", "absent de HA"
+            elif gap > seuil:
+                try:
+                    g_on = _heartbeat_guard_actif(c["guard"], index, datetime.now())
+                except Exception:
+                    g_on = False
+                ic = "[GUARD]" if g_on else "[ALERTE]"
+                txt = "%dmin > %dmin" % (gap, seuil)
+                if g_on:
+                    txt += " (etouffe)"
+            else:
+                ic, txt = "[OK]", "%dmin / %dmin" % (gap, seuil)
+            lignes.append(ic + " " + eid.replace("sensor.", ""))
+            lignes.append("   " + str(c["description"]))
+            lignes.append("   gap " + txt + " | guard " + str(c["guard"]))
+            lignes.append("   alertes %d | dryrun %d" % (na or 0, nd or 0))
+            if la:
+                lignes.append("   derniere alerte " + str(la)[:16])
+            lignes.append("")
+        try:
+            rows = conn.execute(
+                "SELECT ts_iso, entity_id, gap_min, guard_active FROM heartbeat_v2_dryrun ORDER BY id DESC LIMIT 5"
+            ).fetchall()
+            if rows:
+                lignes.append("Derniers dry-runs :")
+                for ts, e2, g, gd in rows:
+                    lignes.append("  %s | %s | %dmin | %s" % (
+                        str(ts)[:16], e2.replace("sensor.", ""), g,
+                        "etouffe" if gd else "aurait alerte"))
+            else:
+                lignes.append("Aucun dry-run : aucun gap n'a depasse son seuil.")
+        except Exception:
+            pass
+        conn.close()
+        return "\n".join(lignes)
+    except Exception as e:
+        return "/heartbeat : erreur %s" % e
 
 
 def cmd_heartbeat():
@@ -12712,7 +12808,7 @@ def _traiter_message_impl(texte):
         "automatisations": cmd_automatisations, "automations": cmd_automatisations,
         "addons": cmd_addons,
         "budget": cmd_budget,
-        "heartbeat": cmd_heartbeat,
+        "heartbeat": cmd_heartbeat_v2,
         "debug": cmd_debug,
         "trace": cmd_trace,
         "cerveau": cmd_cerveau,
