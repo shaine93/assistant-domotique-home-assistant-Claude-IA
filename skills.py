@@ -11987,15 +11987,25 @@ def _heartbeat_v2_check_auto_bascule(now):
         if days >= 7:
             mem_set("heartbeat_v2_mode", "alerts")
             log.warning(f"💓 heartbeat_v2 : bascule auto log_only → alerts après {days:.1f} jours")
+            # Patch 11/08/2026 : la liste des sensors etait codee en dur dans le
+            # message et mentionnait encore ecojoko_consommation_reseau, retire du
+            # heartbeat le 03/06/2026 — le message decrivait une surveillance
+            # inexistante. Elle est desormais generee depuis _HEARTBEAT_V2_SENSORS,
+            # donc toujours exacte quelles que soient les evolutions de la whitelist.
+            try:
+                _liste_sensors = "\n".join(
+                    f"  • {c['entity_id']} (gap max {c['max_gap_min']}min, guard {c['guard']})"
+                    for c in _HEARTBEAT_V2_SENSORS
+                ) or "  (aucun sensor dans la whitelist)"
+            except Exception:
+                _liste_sensors = "  (liste indisponible)"
             telegram_send(
                 "✅ HEARTBEAT V2 — Bascule en mode ALERTES\n"
                 "━━━━━━━━━━━━━━━━━━\n"
                 f"Le skill a tourné {days:.0f} jours en mode log_only sans incident.\n"
                 "Il bascule automatiquement en mode alertes Telegram.\n\n"
-                "Sensors surveillés :\n"
-                "  • sensor.ecojoko_consommation_reseau (gap max 30min)\n"
-                "  • sensor.ecu_today_energy (gap max 60min, guard solar)\n"
-                "  • sensor.ecu_current_power (gap max 30min, guard solar)\n\n"
+                f"Sensors surveillés ({len(_HEARTBEAT_V2_SENSORS)}) :\n"
+                f"{_liste_sensors}\n\n"
                 "Pour désactiver à tout moment : /heartbeat off"
             )
     except Exception as e:
@@ -12005,7 +12015,8 @@ def _heartbeat_v2_check_auto_bascule(now):
 def _heartbeat_observe(index, now):
     """Skill heartbeat_pilier v2 (reconstruction propre 14/05/2026).
 
-    Surveille 3 sensors énergétiques critiques avec garde-fous stricts :
+    Surveille les sensors énergétiques de _HEARTBEAT_V2_SENSORS avec garde-fous
+    stricts (la whitelist a compté 3 sensors à l'origine, 2 depuis le 03/06/2026) :
       - Whitelist explicite (pas d'auto-détection)
       - Guards contextuels obligatoires (météo, horaire solaire)
       - Mode log_only par défaut pendant 7 jours puis bascule auto
